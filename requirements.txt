@@ -1,0 +1,4 @@
+requests
+scrapetube
+beautifulsoup4
+playwright
