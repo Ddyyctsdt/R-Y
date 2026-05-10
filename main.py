@@ -1,6 +1,7 @@
 """
 main.py - حلقه اصلی ربات YouTube Bale Bot (نسخه ۳)
 رفع باگ‌های ارسال سند، تحویل نتایج جستجو، پاسخ کال‌بک تکراری و مدیریت upload
+اضافه شدن timeout برای عملیات‌ها، فرمان /channel و پایداری worker
 """
 
 import os
@@ -12,6 +13,7 @@ import queue
 import re
 import json
 import traceback
+import concurrent.futures
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -310,7 +312,7 @@ def enqueue_job(job: Dict[str, Any]) -> None:
     _log.info(f"وظیفه {job['job_id']} ({job.get('command')}) اضافه شد.")
 
 def process_job(job: Dict[str, Any]) -> None:
-    """پردازش یک وظیفه از صف"""
+    """پردازش یک وظیفه از صف (بدون لاگ‌های تکراری شروع/پایان)"""
     command = job.get("command")
     params = job.get("params", {})
     chat_id = job.get("chat_id")
@@ -320,11 +322,27 @@ def process_job(job: Dict[str, Any]) -> None:
 
     try:
         if command == "search":
-            query = params["query"]
+            query = params.get("query", "")
             limit = params.get("limit", 10)
             config = load_method_config()
             search_mode = config.get("search_mode", "browser")
-            results, method_used = youtube_core.search_youtube(query, limit=limit, mode=search_mode)
+
+            # اجرای جستجو با timeout
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    youtube_core.search_youtube, query=query, limit=limit, mode=search_mode
+                )
+                try:
+                    results, method_used = future.result(timeout=settings.SEARCH_TIMEOUT)
+                except concurrent.futures.TimeoutError:
+                    _log.warning(f"جستجو برای '{query}' بیش از {settings.SEARCH_TIMEOUT}s طول کشید.")
+                    send_message(chat_id, f"⏰ جستجو زمان‌بر شد. لطفاً دوباره تلاش کنید.")
+                    return
+                except Exception as e:
+                    _log.exception(f"خطا در جستجو: {e}")
+                    send_message(chat_id, f"⛔ خطا در جستجو: {str(e)[:200]}")
+                    return
+
             if not results:
                 send_message(chat_id, "🔎 نتیجه‌ای یافت نشد.")
                 return
@@ -355,16 +373,29 @@ def process_job(job: Dict[str, Any]) -> None:
             })
 
         elif command == "info":
-            video_id = params["video_id"]
-            info, method_used = youtube_core.get_video_info(video_id)
-            if not info or not info.get("title"):
+            video_id = params.get("video_id")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(youtube_core.get_video_info, video_id=video_id)
+                try:
+                    info_dict, method_used = future.result(timeout=settings.INFO_TIMEOUT)
+                except concurrent.futures.TimeoutError:
+                    _log.warning(f"دریافت اطلاعات برای {video_id} بیش از {settings.INFO_TIMEOUT}s طول کشید.")
+                    send_message(chat_id, "⏰ دریافت اطلاعات زمان‌بر شد. لطفاً دوباره تلاش کنید.")
+                    return
+                except Exception as e:
+                    _log.exception(f"خطا در دریافت اطلاعات: {e}")
+                    send_message(chat_id, f"⛔ خطا: {str(e)[:200]}")
+                    return
+
+            if not info_dict or not info_dict.get("title"):
                 send_message(chat_id, "❌ اطلاعات ویدیو دریافت نشد.")
                 return
 
             # دانلود و ارسال تامنیل
             thumb_path, _ = youtube_core.download_thumbnail(video_id, job_folder)
             if thumb_path:
-                send_document(chat_id, thumb_path, caption=f"{info['title']} (روش: {method_used})")
+                send_document(chat_id, thumb_path, caption=f"{info_dict['title']} (روش: {method_used})")
                 try:
                     os.remove(thumb_path)
                 except OSError:
@@ -372,19 +403,18 @@ def process_job(job: Dict[str, Any]) -> None:
 
             # متن اطلاعات
             msg = (
-                f"📹 {info.get('title')}\n"
-                f"👤 {info.get('author', '؟')}\n"
-                f"👁 {info.get('view_count', '؟')} | ⏱ {info.get('duration', '؟')} ثانیه\n"
-                f"📝 {info.get('description', '' )[:200]}\n\n"
+                f"📹 {info_dict.get('title')}\n"
+                f"👤 {info_dict.get('author', '؟')}\n"
+                f"👁 {info_dict.get('view_count', '؟')} | ⏱ {info_dict.get('duration', '؟')} ثانیه\n"
+                f"📝 {info_dict.get('description', '' )[:200]}\n\n"
                 f"🔗 https://youtube.com/watch?v={video_id}\n"
                 f"🧩 روش: {method_used}"
             )
             send_message(chat_id, msg)
 
         elif command == "download":
-            video_id = params["video_id"]
+            video_id = params.get("video_id")
             config = load_method_config()
-            # اصلاح: استفاده از کلید "download_quality" بجای "quality"
             quality = config.get("download_quality", "720p")
             upload_mode = config.get("upload_mode", "playable_chunks")
             file_path, method_used = youtube_core.download_video(video_id, job_folder, quality=quality)
@@ -404,7 +434,7 @@ def process_job(job: Dict[str, Any]) -> None:
                 parts = split_file_binary(zip_path, os.path.splitext(os.path.basename(zip_path))[0], ".zip")
                 os.remove(zip_path)
 
-            # ارسال از طریق upload_manager (حذف پارامتر caption ناسازگار)
+            # ارسال از طریق upload_manager
             state_file = os.path.join(settings.DATA_DIR, f"upload_state_{job_id}.json")
             success = upload_manager(parts, chat_id, send_document, state_file, max_retries=2)
             if success:
@@ -423,6 +453,51 @@ def process_job(job: Dict[str, Any]) -> None:
                     os.remove(file_path)
                 except OSError:
                     pass
+
+        elif command == "channel":
+            channel_id = params.get("channel_id")
+            sort_by = params.get("sort_by", "newest")
+            limit = params.get("limit", settings.CHANNEL_VIDEOS_LIMIT)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    youtube_core.get_channel_videos,
+                    channel_id=channel_id, sort_by=sort_by, max_results=limit
+                )
+                try:
+                    videos = future.result(timeout=settings.SEARCH_TIMEOUT)
+                except concurrent.futures.TimeoutError:
+                    send_message(chat_id, "⏰ دریافت ویدیوهای کانال زمان‌بر شد. لطفاً دوباره تلاش کنید.")
+                    return
+                except Exception as e:
+                    _log.exception(f"خطا در channel: {e}")
+                    send_message(chat_id, f"⛔ خطا: {str(e)[:200]}")
+                    return
+
+            if not videos:
+                send_message(chat_id, "❌ دریافت ویدیوهای کانال ناموفق بود.")
+                return
+
+            register_videos_from_search(videos)
+            lines = [f"📺 ویدیوهای کانال (مرتب‌سازی: {sort_by}) — {len(videos)} نتیجه"]
+            for idx, v in enumerate(videos, 1):
+                title = (v.get('title') or 'بی‌نام')[:40]
+                duration = v.get('duration', '?')
+                views = v.get('views', '?')
+                lines.append(f"{idx}️⃣ {title} | ⏱ {duration} | 👁 {views}")
+                lines.append(f"   📋 /H{idx}   📥 /Download_{idx}")
+
+            # ارسال تکه‌ای (بسته‌های ۱۵ تایی)
+            chunk_size = 15
+            for i in range(0, len(lines), chunk_size):
+                chunk = lines[i:i+chunk_size]
+                send_message(chat_id, "\n".join(chunk))
+
+            save_last_search({
+                "results": videos,
+                "query": f"channel:{channel_id}",
+                "method": "playwright_channel",
+            })
 
         elif command == "batch_download":
             last = load_last_search().get("results", [])
@@ -449,14 +524,8 @@ def process_job(job: Dict[str, Any]) -> None:
         except Exception:
             pass
 
-        # حذف از فایل صف
-        with queue_lock:
-            jobs = load_json(settings.QUEUE_FILE, [])
-            jobs = [j for j in jobs if j.get("job_id") != job_id]
-            save_json(settings.QUEUE_FILE, jobs)
-
 def worker_loop() -> None:
-    """حلقه کارگر صف"""
+    """حلقه کارگر صف با محافظت در برابر خرابی"""
     _log.info("کارگر صف آغاز به کار کرد.")
     with queue_lock:
         pending = load_json(settings.QUEUE_FILE, [])
@@ -465,9 +534,33 @@ def worker_loop() -> None:
         _log.info(f"{len(pending)} وظیفه از فایل صف بارگذاری شد.")
 
     while True:
-        job = task_queue.get()
-        process_job(job)
-        task_queue.task_done()
+        try:
+            job = task_queue.get(timeout=30)
+        except queue.Empty:
+            continue
+
+        job_id = job.get('job_id', '?')
+        command = job.get('command', '?')
+        chat_id = job.get('chat_id')
+
+        try:
+            _log.info(f"شروع پردازش {job_id} ({command})")
+            process_job(job)
+            _log.info(f"پایان وظیفه {job_id}")
+        except Exception as e:
+            _log.exception(f"وظیفه {job_id} با خطا مواجه شد: {e}")
+            try:
+                if chat_id:
+                    send_message(chat_id, f"⛔ خطا در پردازش درخواست: {str(e)[:200]}")
+            except:
+                pass
+        finally:
+            task_queue.task_done()
+            # حذف job از فایل صف
+            with queue_lock:
+                jobs = load_json(settings.QUEUE_FILE, [])
+                jobs = [j for j in jobs if j.get("job_id") != job.get("job_id")]
+                save_json(settings.QUEUE_FILE, jobs)
 
 # ──────────────── مدیریت پیام‌های کاربر ────────────────
 
@@ -509,6 +602,7 @@ def handle_message(chat_id: int, text: str) -> None:
             "همچنین می‌توانید فرمان‌های سریع زیر را بفرستید:\n"
             "/H1 → اطلاعات ویدیوی شماره ۱\n"
             "/Download_1 → دانلود ویدیوی شماره ۱\n"
+            "/channel @handle newest → ویدیوهای کانال\n"
             "/batchdownload → دانلود همه نتایج آخرین جستجو\n"
             "/log → دریافت فایل لاگ\n"
             "/start → نمایش منو"
@@ -540,6 +634,28 @@ def handle_message(chat_id: int, text: str) -> None:
                 send_message(chat_id, "❌ کد نامعتبر. ابتدا جستجو کنید.")
         else:
             send_message(chat_id, "❌ فرمت نادرست. مثال: /Download_1")
+
+    elif text.startswith("/channel"):
+        parts = text.split()
+        if len(parts) < 2:
+            send_message(chat_id, "❗ مثال:\n/channel @Google newest\n"
+                                 "/channel UCXuqSBlHAE6Xw-yeJA0Tunw popular\n\n"
+                                 "مرتب‌سازی: newest, oldest, popular")
+            return
+
+        channel_id = parts[1]
+        sort_by = parts[2] if len(parts) > 2 else "newest"
+
+        if sort_by not in ("newest", "oldest", "popular"):
+            send_message(chat_id, "❗ مرتب‌سازی باید newest, oldest یا popular باشد.")
+            return
+
+        enqueue_job({
+            "command": "channel",
+            "params": {"channel_id": channel_id, "sort_by": sort_by},
+            "chat_id": chat_id
+        })
+        send_message(chat_id, f"📺 در حال دریافت ویدیوهای کانال {channel_id} (مرتب‌سازی: {sort_by})...")
 
     elif text == "/batchdownload":
         last = load_last_search().get("results", [])
@@ -635,7 +751,6 @@ def handle_callback(chat_id: int, data: str, message_id: int, callback_query_id:
 
     elif action == "settings_quality":
         config = load_method_config()
-        # اصلاح: استفاده از کلید "download_quality"
         current = config.get("download_quality", "720p")
         keyboard = build_quality_keyboard(current)
         edit_message_text(chat_id, message_id, "کیفیت دانلود:", reply_markup=keyboard)
@@ -643,7 +758,6 @@ def handle_callback(chat_id: int, data: str, message_id: int, callback_query_id:
     elif action == "quality_set":
         quality = parts[1]
         config = load_method_config()
-        # اصلاح: ذخیره تحت کلید "download_quality"
         config["download_quality"] = quality
         save_method_config(config)
         answer_callback_query(callback_query_id, f"کیفیت روی {quality} تنظیم شد.")
