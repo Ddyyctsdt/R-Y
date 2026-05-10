@@ -1,210 +1,264 @@
 """
-settings.py - پیکربندی و ثابت‌های اصلی ربات یوتیوب Bale (نسخه ۳)
-توکن، متدهای جستجو/دانلود/اطلاعات، تنظیمات UI، زنجیره‌های fallback و ...
-فقط شامل تعریف متغیرها (بدون منطق پیچیده).
+settings.py – پیکربندی اصلی پروژه YouTube Bale Bot
+تعریف تمام ثابت‌ها، مسیرها، متدها، زنجیره‌های fallback و تنظیمات رابط کاربری
 """
 
 import os
 import sys
 
-# ──────────────────────────────────────
-# توکن ربات و API بیس
-# ──────────────────────────────────────
+# ──────────────── توکن و API بله ────────────────
 BOT_TOKEN = os.environ.get("BALE_BOT_TOKEN")
 if not BOT_TOKEN:
-    print("❌ BALE_BOT_TOKEN در متغیرهای محیطی یافت نشد.")
+    print("خطا: توکن ربات تنظیم نشده است. متغیر محیطی BALE_BOT_TOKEN را مقداردهی کنید.")
     sys.exit(1)
 
 API_BASE = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 
-# ──────────────────────────────────────
-# زمان‌بندی و محدودیت‌های شبکه
-# ──────────────────────────────────────
-REQUEST_TIMEOUT = 30                # ثانیه - زمان انتظار برای درخواست‌های معمولی
-LONG_POLL_TIMEOUT = 50             # ثانیه - زمان انتظار long‑polling
+# ──────────────── ثابت‌های شبکه ────────────────
+REQUEST_TIMEOUT = 30          # ثانیه، تایم‌اوت درخواست‌های HTTP
+LONG_POLL_TIMEOUT = 50        # ثانیه، تایم‌اوت long polling
 
-# ──────────────────────────────────────
-# محدودیت‌های اندازه فایل
-# ──────────────────────────────────────
-MAX_SEND_SIZE = 20 * 1024 * 1024   # 20 مگابایت – حداکثر اندازه ارسال مستقیم در بله
-ZIP_PART_SIZE = 20 * 1024 * 1024   # 20 مگابایت – اندازه هر بخش در حالت ZIP
-MAX_VIDEO_DURATION = 7200          # ثانیه - حداکثر مدت ویدئو (۲ ساعت)
-MAX_DOWNLOAD_RETRIES = 3           # تعداد تلاش مجدد برای هر بخش در آپلود ناموفق
-MAX_CHUNK_SIZE = 19 * 1024 * 1024  # 19 مگابایت – اندازه هدف برای قطعات قابل پخش (اسپلیت حجمی)
+# ── timeout برای عملیات (ثانیه) ──
+SEARCH_TIMEOUT = 25            # حداکثر زمان برای جستجوی مرورگر (Playwright)
+INFO_TIMEOUT = 20              # حداکثر زمان برای دریافت اطلاعات ویدیو
+CHANNEL_VIDEOS_LIMIT = 50      # حداکثر تعداد ویدیوهای استخراج‌شده از کانال
+BROWSER_IDLE_TIMEOUT = 600     # ۱۰ دقیقه - بستن خودکار مرورگرهای باز
+MAX_RELATED_DEPTH = 3          # حداکثر عمق برای ویدیوهای مشابه (پیشنهادی)
 
-# ──────────────────────────────────────
-# مسیرها و دایرکتوری‌ها
-# ──────────────────────────────────────
+# ──────────────── محدودیت‌های فایل ────────────────
+MAX_SEND_SIZE = 20 * 1024 * 1024          # ۲۰ مگابایت (حداکثر اندازه برای ارسال مستقیم، در غیر این صورت تکه‌تکه می‌شود)
+MAX_VIDEO_DURATION = 7200                 # حداکثر مدت ویدیو به ثانیه (۲ ساعت)
+ZIP_PART_SIZE = 20 * 1024 * 1024          # اندازه هر تکه هنگام تقسیم فایل (بایت)
+
+# ──────────────── مسیرها ────────────────
 DATA_DIR = "data"
-QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")
-ADMIN_FILE = os.path.join(DATA_DIR, "admin.json")
-METHOD_CONFIG_FILE = os.path.join(DATA_DIR, "method_config.json")
-UPLOAD_STATE_FILE = os.path.join(DATA_DIR, "upload_state.json")
-LOG_FILE = "bot.log"
-DOWNLOADS_DIR = "downloads"
-DEBUG_DIR = "debug"
+QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")                       # فایل صف وظایف
+ADMIN_FILE = os.path.join(DATA_DIR, "admin.json")                       # فایل شناسه ادمین
+METHOD_CONFIG_FILE = os.path.join(DATA_DIR, "method_config.json")       # فایل تنظیمات متدها (اولویت‌ها)
+LOG_FILE = "log.txt"                                                    # فایل لاگ
+DOWNLOADS_DIR = "downloads"                                             # پوشه دانلودهای موقت
+DEBUG_DIR = "debug"                                                     # پوشه ذخیرهٔ پاسخ‌های API در حالت دیباگ
 
-# ──────────────────────────────────────
-# User-Agent و FFmpeg
-# ──────────────────────────────────────
+# ──────────────── User‑Agent و FFmpeg ────────────────
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
+    "Chrome/120.0.0.0 Safari/537.36"
 )
-FFMPEG_PATH = "ffmpeg"   # فرض بر این است که در PATH سیستم موجود باشد
+FFMPEG_PATH = "ffmpeg"   # فرض بر این است که ffmpeg در PATH سیستم موجود است
 
-# ──────────────────────────────────────
-# ادمین
-# ──────────────────────────────────────
-DEFAULT_ADMIN_CHAT_ID = 46829437   # در صورت نبود admin.json استفاده می‌شود
+# ──────────────── شناسه ادمین پیش‌فرض ────────────────
+DEFAULT_ADMIN_CHAT_ID = 123456789   # در صورت نبودن فایل admin.json، این شناسه استفاده می‌شود
 
-# ──────────────────────────────────────
-# تعریف متدهای جستجو (فقط Scrapetube)
-# ──────────────────────────────────────
+# ──────────────── تعریف متدهای جستجو ────────────────
 SEARCH_METHODS = {
+    "piped": {
+        "name": "Piped API",
+        "emoji": "🔍",
+        "description": "جستجو از طریق Piped (پایدار و رایگان)",
+        "requires_key": False,
+        "max_results": 20,
+    },
+    "newpipe": {
+        "name": "NewPipe Extractor",
+        "emoji": "🔍",
+        "description": "کتابخانهٔ NewPipe (اندروید کلاینت)",
+        "requires_key": False,
+        "max_results": 20,
+    },
+    "innertube2": {
+        "name": "InnerTube API v2",
+        "emoji": "🔍",
+        "description": "API خصوصی یوتیوب (MohammadKobirShah)",
+        "requires_key": False,
+        "max_results": 20,
+    },
     "scrapetube": {
         "name": "Scrapetube",
-        "emoji": "🔎",
-        "description": "اسکرپر سبک (فقط شناسه)",
+        "emoji": "🔍",
+        "description": "اسکرپر سبک (فقط شناسه برمی‌گرداند)",
         "requires_key": False,
         "max_results": 10,
-        "enabled": True
-    }
+    },
+    "youtube_search_python": {
+        "name": "YouTube Search Python",
+        "emoji": "🔍",
+        "description": "جستجوی پایتونی (نیاز به پراکسی دارد)",
+        "requires_key": False,
+        "max_results": 10,
+    },
+    "py_yt_search": {
+        "name": "py-yt-search",
+        "emoji": "🔍",
+        "description": "کتابخانه AshokShau (جستجو + اطلاعات)",
+        "requires_key": False,
+        "max_results": 10,
+    },
+    "duckduckgo": {
+        "name": "DuckDuckGo + HTML",
+        "emoji": "🔍",
+        "description": "جستجوی غیرمستقیم از طریق DuckDuckGo",
+        "requires_key": False,
+        "max_results": 10,
+    },
+    "html_parse": {
+        "name": "HTML Parse (ytInitialData)",
+        "emoji": "🔍",
+        "description": "پارس مستقیم صفحهٔ نتایج یوتیوب",
+        "requires_key": False,
+        "max_results": 10,
+    },
 }
 
-# ──────────────────────────────────────
-# تعریف متدهای دانلود
-# ──────────────────────────────────────
-DOWNLOAD_METHODS = {
-    "hubytconvert": {
-        "name": "hub.ytconvert.org",
-        "emoji": "📥",
-        "description": "API امن و تست‌شده (پروکسی واسط)",
+# ──────────────── تعریف متدهای دریافت اطلاعات ────────────────
+INFO_METHODS = {
+    "piped": {
+        "name": "Piped API",
+        "emoji": "📋",
+        "description": "اطلاعات کامل ویدیو از Piped",
         "requires_key": False,
-        "max_quality": "1080p",
-        "enabled": True
     },
+    "newpipe": {
+        "name": "NewPipe Extractor",
+        "emoji": "📋",
+        "description": "استخراج اطلاعات با NewPipe",
+        "requires_key": False,
+    },
+    "innertube2": {
+        "name": "InnerTube API v2",
+        "emoji": "📋",
+        "description": "اطلاعات از API خصوصی یوتیوب",
+        "requires_key": False,
+    },
+    "oembed": {
+        "name": "oEmbed",
+        "emoji": "📋",
+        "description": "داده‌های محدود از oEmbed یوتیوب",
+        "requires_key": False,
+    },
+    "yt_dlp": {
+        "name": "yt-dlp",
+        "emoji": "📋",
+        "description": "استخراج کامل با yt-dlp",
+        "requires_key": False,
+    },
+    "py_yt_search": {
+        "name": "py-yt-search",
+        "emoji": "📋",
+        "description": "اطلاعات از کتابخانه AshokShau",
+        "requires_key": False,
+    },
+}
+
+# ──────────────── تعریف متدهای دانلود ویدیو ────────────────
+DOWNLOAD_METHODS = {
     "cobalt": {
         "name": "Cobalt.tools",
         "emoji": "📥",
-        "description": "دانلودر چندپلتفرمه (یوتیوب، تیک‌تاک و ...)",
+        "description": "دانلودر قدرتمند و رایگان (pybalt)",
         "requires_key": False,
         "max_quality": "1080p",
-        "enabled": True
     },
-    "allmedia": {
-        "name": "AllMedia Downloader",
+    "yt_dlp_pot": {
+        "name": "yt-dlp + PO Token",
         "emoji": "📥",
-        "description": "API رایگان چندپلتفرمه",
+        "description": "yt-dlp با توکن Proof of Origin",
+        "requires_key": False,
+        "max_quality": "4K",
+    },
+    "newpipe": {
+        "name": "NewPipe Extractor",
+        "emoji": "📥",
+        "description": "استخراج لینک استریم با NewPipe",
         "requires_key": False,
         "max_quality": "1080p",
-        "enabled": True
-    }
-}
-
-# ──────────────────────────────────────
-# تعریف متدهای اطلاعات ویدئو (فقط oEmbed)
-# ──────────────────────────────────────
-INFO_METHODS = {
-    "oembed": {
-        "name": "YouTube oEmbed",
-        "emoji": "ℹ️",
-        "description": "اطلاعات پایه (عنوان، آپلودر، تامنیل)",
+    },
+    "innertube2_stream": {
+        "name": "InnerTube Stream",
+        "emoji": "📥",
+        "description": "لینک مستقیم از InnerTube API",
         "requires_key": False,
-        "max_results": 1,
-        "enabled": True
-    }
+        "max_quality": "720p",
+    },
+    "piped_stream": {
+        "name": "Piped Stream",
+        "emoji": "📥",
+        "description": "لینک استریم از Piped",
+        "requires_key": False,
+        "max_quality": "1080p",
+    },
+    "pytube": {
+        "name": "PyTube (Fork)",
+        "emoji": "📥",
+        "description": "آخرین شانس - معمولاً خراب است",
+        "requires_key": False,
+        "max_quality": "720p",
+    },
 }
 
-# ──────────────────────────────────────
-# متدهای تکمیل اطلاعات (Enrichment) برای حالت browser
-# ──────────────────────────────────────
-ENRICHMENT_METHODS = {
-    "dom_search_page": {
-        "name": "DOM Search Page",
-        "description": "استخراج مستقیم از صفحه جستجو",
-        "enabled": True
-    },
-    "oembed_enrich": {
-        "name": "oEmbed Enrichment",
-        "description": "اطلاعات سریع و سبک (عنوان، تامنیل)",
-        "enabled": True
-    },
-    "dom_watch_page": {
-        "name": "Watch Page DOM",
-        "description": "باز کردن صفحه ویدیو (عمیق - دیدئو، لایک، توضیحات)",
-        "enabled": True
-    },
-    "json_ld": {
-        "name": "JSON-LD Parser",
-        "description": "استخراج structured data از صفحه",
-        "enabled": True
-    }
-}
+# ──────────────── زنجیره‌های پیش‌فرض (Fallback Chains) ────────────────
+DEFAULT_SEARCH_CHAIN = [
+    "piped",
+    "newpipe",
+    "innertube2",
+    "scrapetube",
+    "youtube_search_python",
+    "py_yt_search",
+    "duckduckgo",
+    "html_parse",
+]
 
-# ──────────────────────────────────────
-# زنجیره‌های پیش‌فرض (ترتیب اولویت)
-# ──────────────────────────────────────
-DEFAULT_SEARCH_CHAIN = ["scrapetube"]          # در حالت API فقط این
-DEFAULT_INFO_CHAIN = ["oembed"]
-DEFAULT_DOWNLOAD_CHAIN = ["hubytconvert", "cobalt", "allmedia"]
+DEFAULT_INFO_CHAIN = [
+    "piped",
+    "newpipe",
+    "innertube2",
+    "oembed",
+    "yt_dlp",
+    "py_yt_search",
+]
 
-# ──────────────────────────────────────
-# تنظیمات ظاهری و کاربری UI
-# ──────────────────────────────────────
+DEFAULT_DOWNLOAD_CHAIN = [
+    "cobalt",
+    "yt_dlp_pot",
+    "newpipe",
+    "innertube2_stream",
+    "piped_stream",
+    "pytube",
+]
+
+# ──────────────── تنظیمات رابط کاربری (UI) ────────────────
 UI_SETTINGS = {
-    "show_method_in_output": True,        # نمایش نام متد موفق در خروجی
-    "show_thumbnails": True,              # ارسال تصویر بند‌انگشتی
-    "show_download_button": True,         # دکمه دانلود در نتایج
-    "show_next_method_button": True,      # دکمه «متد بعدی»
-    "result_page_size": 5,               # تعداد نتایج در هر صفحه (پیش‌فرض)
-    "emoji_enabled": True,
-    "download_quality": "720p",          # کیفیت پیش‌فرض دانلود
-    "search_mode": "browser",            # "browser" یا "api" – حالت جستجو
+    "show_method_in_output": True,       # نمایش نام متد در خروجی
+    "show_thumbnails": True,             # ارسال تامنیل همراه نتایج
+    "show_download_button": True,        # دکمهٔ دانلود زیر هر ویدیو
+    "show_next_method_button": True,     # دکمهٔ «🔁 متد بعدی»
+    "result_page_size": 5,               # تعداد نتایج در هر صفحه
+    "emoji_enabled": True,               # استفاده از ایموجی
 }
 
-# ──────────────────────────────────────
-# تنظیمات پیش‌فرض نشست (ذخیره در method_config.json)
-# ──────────────────────────────────────
+# ──────────────── تنظیمات دیباگ ────────────────
+DEBUG_MODE = os.getenv("DEBUG", "0") == "1"   # فعال‌سازی لاگ بیشتر و ذخیره پاسخ‌ها
+SAVE_RESPONSES = DEBUG_MODE                   # در حالت دیباگ، پاسخ‌های API ذخیره شوند
+
+# ──────────────── کتابخانه‌های مورد نیاز (برای بررسی نصب و import پویا) ────────────────
+REQUIRED_LIBS = [
+    "requests",
+    "yt_dlp",
+    "scrapetube",
+    "pybalt",              # Cobalt.tools wrapper
+    "beautifulsoup4",      # برای پارس HTML (در صورت نیاز)
+    # سایر کتابخانه‌ها (innertube, newpipe, ...) اختیاری و در زمان اجرا import می‌شوند
+]
+
+# ──────────────── تنظیمات پیش‌فرض session (در method_config.json ذخیره می‌شود) ────────────────
 DEFAULT_SESSION_SETTINGS = {
     "search_chain": DEFAULT_SEARCH_CHAIN[:],
     "info_chain": DEFAULT_INFO_CHAIN[:],
     "download_chain": DEFAULT_DOWNLOAD_CHAIN[:],
-    "enabled_search_methods": list(SEARCH_METHODS.keys()),
-    "enabled_download_methods": list(DOWNLOAD_METHODS.keys()),
-    "upload_mode": "playable_chunks",
-    "chunk_duration_seconds": 60,            # فقط در صورت نیاز به اسپلیت زمانی
     "result_page_size": 5,
-    "download_quality": "720p",
-    "search_mode": "browser",               # "browser" یا "api"
-    "enabled_enrichment_methods": list(ENRICHMENT_METHODS.keys())
+    "show_thumbnails": True,
 }
 
-# ──────────────────────────────────────
-# حالت‌های آپلود
-# ──────────────────────────────────────
-UPLOAD_MODES = {
-    "zip": {
-        "description": "فشرده‌سازی کل ویدئو به ZIP و تقسیم به بخش‌های 20 مگابایتی"
-    },
-    "playable_chunks": {
-        "description": "تقسیم ویدئو به قطعات قابل پخش با حجم حداکثر 19 مگابایت"
-    }
-}
-
-# ──────────────────────────────────────
-# کتابخانه‌های مورد نیاز (جهت اطلاع)
-# ──────────────────────────────────────
-REQUIRED_LIBS = [
-    "requests",
-    "scrapetube",
-    "beautifulsoup4",
-    "playwright",   # برای جستجوی browser‑based
-    # cobalt و allmedia با HTTP خام فراخوانی می‌شوند
-]
-
-# ──────────────────────────────────────
-# حالت دیباگ
-# ──────────────────────────────────────
-DEBUG_MODE = os.environ.get("DEBUG", "0") == "1"
+# ──────────────── تنظیمات پروکسی و PO Token ────────────────
+WARP_PROXY_URL = "http://127.0.0.1:8080"        # آدرس پروکسی HTTP که توسط کانتینر wgcf-proxy ایجاد می‌شود
+PO_TOKEN_SERVER_URL = "http://127.0.0.1:4416"    # آدرس سرور تولید PO Token (bgutil-ytdlp-pot-provider)
