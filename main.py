@@ -1,7 +1,7 @@
 """
 main.py - حلقه اصلی ربات YouTube Bale Bot (نسخه ۳)
 رفع باگ‌های ارسال سند، تحویل نتایج جستجو، پاسخ کال‌بک تکراری و مدیریت upload
-اضافه شدن timeout برای عملیات‌ها، فرمان /channel و پایداری worker
+اضافه شدن timeout برای عملیات‌ها، فرمان /channel، پایداری worker و محافظت در برابر هنگ
 """
 
 import os
@@ -327,7 +327,6 @@ def process_job(job: Dict[str, Any]) -> None:
             config = load_method_config()
             search_mode = config.get("search_mode", "browser")
 
-            # اجرای جستجو با timeout
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(
                     youtube_core.search_youtube, query=query, limit=limit, mode=search_mode
@@ -347,7 +346,6 @@ def process_job(job: Dict[str, Any]) -> None:
                 send_message(chat_id, "🔎 نتیجه‌ای یافت نشد.")
                 return
 
-            # ثبت ویدیوها و ارسال نتایج با مدیریت خطای داخلی
             try:
                 register_videos_from_search(results)
                 lines = [f"🔍 نتایج جستجو برای: {query} (روش: {method_used})"]
@@ -365,7 +363,6 @@ def process_job(job: Dict[str, Any]) -> None:
                     simple_lines.append(f"{v.get('title','?')} - {v.get('video_id')}")
                 send_message(chat_id, "\n".join(simple_lines))
 
-            # ذخیره آخرین جستجو
             save_last_search({
                 "results": results,
                 "query": query,
@@ -392,16 +389,22 @@ def process_job(job: Dict[str, Any]) -> None:
                 send_message(chat_id, "❌ اطلاعات ویدیو دریافت نشد.")
                 return
 
-            # دانلود و ارسال تامنیل
-            thumb_path, _ = youtube_core.download_thumbnail(video_id, job_folder)
-            if thumb_path:
-                send_document(chat_id, thumb_path, caption=f"{info_dict['title']} (روش: {method_used})")
-                try:
-                    os.remove(thumb_path)
-                except OSError:
-                    pass
+            # دانلود تامنیل با timeout کوتاه
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as thumb_exec:
+                    thumb_future = thumb_exec.submit(youtube_core.download_thumbnail, video_id, job_folder)
+                    thumb_path, _ = thumb_future.result(timeout=10)
+                    if thumb_path:
+                        send_document(chat_id, thumb_path, caption=f"{info_dict['title']} (روش: {method_used})")
+                        try:
+                            os.remove(thumb_path)
+                        except OSError:
+                            pass
+            except concurrent.futures.TimeoutError:
+                _log.warning("دانلود تامنیل بیش از ۱۰ ثانیه طول کشید - نادیده گرفته شد.")
+            except Exception as e:
+                _log.warning(f"خطای دانلود تامنیل: {e}")
 
-            # متن اطلاعات
             msg = (
                 f"📹 {info_dict.get('title')}\n"
                 f"👤 {info_dict.get('author', '؟')}\n"
@@ -423,9 +426,8 @@ def process_job(job: Dict[str, Any]) -> None:
                 send_message(chat_id, "❌ دانلود ویدیو ناموفق بود.")
                 return
 
-            # تقسیم فایل بر اساس حالت ارسال
             if upload_mode == "playable_chunks":
-                parts = split_video_by_size(file_path, MAX_SEND_SIZE)
+                parts = split_video_by_size(file_path, max_size_bytes=MAX_SEND_SIZE)
             else:
                 import zipfile
                 zip_path = os.path.join(job_folder, f"{video_id}.zip")
@@ -434,9 +436,21 @@ def process_job(job: Dict[str, Any]) -> None:
                 parts = split_file_binary(zip_path, os.path.splitext(os.path.basename(zip_path))[0], ".zip")
                 os.remove(zip_path)
 
-            # ارسال از طریق upload_manager
+            # ارسال با upload_manager با timeout
             state_file = os.path.join(settings.DATA_DIR, f"upload_state_{job_id}.json")
-            success = upload_manager(parts, chat_id, send_document, state_file, max_retries=2)
+            upload_timeout = settings.REQUEST_TIMEOUT * len(parts)
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as up_exec:
+                    up_future = up_exec.submit(upload_manager, parts, chat_id, send_document, state_file, max_retries=2)
+                    success = up_future.result(timeout=upload_timeout)
+            except concurrent.futures.TimeoutError:
+                _log.warning("ارسال ویدیو بیش از حد طول کشید - لغو شد.")
+                send_message(chat_id, "⏰ ارسال ویدیو زمان‌بر شد. لطفاً بعداً بررسی کنید.")
+                success = False
+            except Exception as e:
+                _log.exception(f"خطا در ارسال ویدیو: {e}")
+                success = False
+
             if success:
                 send_message(chat_id, f"✅ ویدیو با موفقیت ارسال شد (روش: {method_used})")
             else:
@@ -487,7 +501,6 @@ def process_job(job: Dict[str, Any]) -> None:
                 lines.append(f"{idx}️⃣ {title} | ⏱ {duration} | 👁 {views}")
                 lines.append(f"   📋 /H{idx}   📥 /Download_{idx}")
 
-            # ارسال تکه‌ای (بسته‌های ۱۵ تایی)
             chunk_size = 15
             for i in range(0, len(lines), chunk_size):
                 chunk = lines[i:i+chunk_size]
@@ -524,8 +537,38 @@ def process_job(job: Dict[str, Any]) -> None:
         except Exception:
             pass
 
+
+# ════════════════ اجرای وظیفه با محافظت در برابر هنگ ════════════════
+
+def run_job_with_timeout(job: dict, timeout_seconds: int) -> Optional[Exception]:
+    """
+    اجرای process_job در یک ترد جداگانه با زمان‌بندی.
+    در صورتی که ترد پس از timeout_seconds ثانیه هنوز زنده بود،
+    ترد رها می‌شود و TimeoutError برگردانده می‌شود.
+    """
+    exception_occurred = None
+
+    def target():
+        nonlocal exception_occurred
+        try:
+            process_job(job)
+        except Exception as e:
+            exception_occurred = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout=timeout_seconds)
+
+    if t.is_alive():
+        _log.critical(f"وظیفه {job.get('job_id')} ({job.get('command')}) پس از {timeout_seconds} ثانیه پایان نیافت — رها شد.")
+        return TimeoutError("Job execution timed out")
+    return exception_occurred
+
+
+# ════════════════ کارگر صف (نسخه مقاوم به هنگ) ════════════════
+
 def worker_loop() -> None:
-    """حلقه کارگر صف با محافظت در برابر خرابی"""
+    """حلقه کارگر صف با محافظت در برابر خرابی و هنگ"""
     _log.info("کارگر صف آغاز به کار کرد.")
     with queue_lock:
         pending = load_json(settings.QUEUE_FILE, [])
@@ -543,24 +586,33 @@ def worker_loop() -> None:
         command = job.get('command', '?')
         chat_id = job.get('chat_id')
 
-        try:
-            _log.info(f"شروع پردازش {job_id} ({command})")
-            process_job(job)
+        _log.info(f"شروع پردازش {job_id} ({command})")
+        err = run_job_with_timeout(job, settings.SEARCH_TIMEOUT + 10)   # ۳۵ ثانیه
+
+        if err is None:
             _log.info(f"پایان وظیفه {job_id}")
-        except Exception as e:
-            _log.exception(f"وظیفه {job_id} با خطا مواجه شد: {e}")
+        elif isinstance(err, TimeoutError):
             try:
                 if chat_id:
-                    send_message(chat_id, f"⛔ خطا در پردازش درخواست: {str(e)[:200]}")
+                    send_message(chat_id, f"⏰ درخواست {command} بیش از حد طول کشید و لغو شد.")
             except:
                 pass
-        finally:
-            task_queue.task_done()
-            # حذف job از فایل صف
-            with queue_lock:
-                jobs = load_json(settings.QUEUE_FILE, [])
-                jobs = [j for j in jobs if j.get("job_id") != job.get("job_id")]
-                save_json(settings.QUEUE_FILE, jobs)
+        else:
+            _log.exception(f"وظیفه {job_id} با خطا مواجه شد: {err}")
+            try:
+                if chat_id:
+                    send_message(chat_id, f"⛔ خطا در پردازش درخواست: {str(err)[:200]}")
+            except:
+                pass
+
+        task_queue.task_done()
+
+        # حذف وظیفه از فایل صف
+        with queue_lock:
+            jobs = load_json(settings.QUEUE_FILE, [])
+            jobs = [j for j in jobs if j.get("job_id") != job_id]
+            save_json(settings.QUEUE_FILE, jobs)
+
 
 # ──────────────── مدیریت پیام‌های کاربر ────────────────
 
@@ -788,6 +840,7 @@ def handle_callback(chat_id: int, data: str, message_id: int, callback_query_id:
 
     else:
         answer_callback_query(callback_query_id, "⚠️ عملیات نامعتبر.")
+
 
 # ──────────────── حلقه اصلی ربات ────────────────
 
