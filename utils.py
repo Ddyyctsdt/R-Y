@@ -1,196 +1,143 @@
 """
-utils.py - توابع کمکی و ابزارهای عمومی ربات یوتیوب Bale Ultimate
-شامل لاگینگ ضد کرش، تقسیم فایل، تقسیم ویدئو با FFmpeg (زمانی و حجمی)،
-مدیریت آپلود هوشمند با ذخیره وضعیت، دانلود فایل و غیره.
-نسخه بازنگری‌شده: افزوده‌شدن split_video_by_size
+utils.py – جعبه ابزار پروژه YouTube Bale Bot
+شامل توابع کمکی برای لاگ‌گیری، مدیریت فایل، دانلود، اعتبارسنجی و کار با JSON
 """
 
-import logging
-import os
 import json
-import time
-import subprocess
+import logging
+import math
+import os
 import re
 import shutil
-import math                               # برای محاسبات تقسیم حجمی
-from urllib.parse import unquote, urlparse
-from typing import Optional, List, Dict, Any, Callable
+import subprocess
+import time
+import threading
+from typing import Dict, Optional, List
+from urllib.parse import urlparse, unquote
 
 import requests
 
 import settings
 
-# ═══════════════════════════════════════════════════════════
-# کلاس Handler برای لاگینگ ضد کرش (فلش اجباری بعد از هر ثبت)
-# ═══════════════════════════════════════════════════════════
+# ──────────────────────────── لاگ‌گیری ضدکرش ────────────────────────────
+
 class FlushFileHandler(logging.FileHandler):
-    """FileHandler که بعد از هر emit دستور flush() را اجرا می‌کند."""
-    def emit(self, record: logging.LogRecord) -> None:
+    """یک FileHandler که پس از هر لاگ flush می‌کند تا در صورت کرش داده‌ها از دست نروند."""
+    def emit(self, record):
         super().emit(record)
         self.flush()
 
-# ═══════════════════════════════════════════════════════════
-# تنظیمات لاگینگ
-# ═══════════════════════════════════════════════════════════
-_logger_initialized = False
 
 def setup_logging() -> None:
-    """تنظیم لاگر اصلی با قالب استاندارد و دو خروجی (فایل و کنسول)."""
-    global _logger_initialized
-    if _logger_initialized:
+    """تنظیم logger اصلی پروژه (youtube_bot) با handlers مربوط به فایل و کنسول."""
+    logger = logging.getLogger('youtube_bot')
+    if logger.handlers:  # قبلاً تنظیم شده
         return
 
-    root_logger = logging.getLogger('youtube_bot')
-    root_logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(
         '%(asctime)s - %(levelname)s - %(name)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # فایل لاگ (ضد کرش)
-    fh = FlushFileHandler(settings.LOG_FILE, encoding='utf-8')
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
-    root_logger.addHandler(fh)
+    # Handler برای فایل لاگ
+    os.makedirs(os.path.dirname(settings.LOG_FILE) or '.', exist_ok=True)
+    file_handler = FlushFileHandler(settings.LOG_FILE, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
 
-    # کنسول
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    ch.setFormatter(formatter)
-    root_logger.addHandler(ch)
+    # Handler برای کنسول
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.DEBUG)
+    stream_handler.setFormatter(formatter)
 
-    root_logger.propagate = False
-    _logger_initialized = True
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    # جلوگیری از ارسال لاگ‌ها به loggerهای بالادستی (root)
+    logger.propagate = False
+
 
 def get_logger(name: str) -> logging.Logger:
-    """برگرداندن یک logger زیرمجموعه 'youtube_bot'. در صورت نیاز، setup_logging را صدا می‌زند."""
-    if not _logger_initialized or not logging.getLogger('youtube_bot').handlers:
+    """برگرداندن یک logger فرزند از youtube_bot با نام داده‌شده."""
+    if not logging.getLogger('youtube_bot').handlers:
         setup_logging()
     return logging.getLogger(f'youtube_bot.{name}')
 
-# ═══════════════════════════════════════════════════════════
-# تقسیم فایل به روش باینری (برای ZIP و ...)
-# ═══════════════════════════════════════════════════════════
+
+# ──────────────────────────── مدیریت فایل ────────────────────────────
+
 def split_file_binary(file_path: str, prefix: str, ext: str) -> List[str]:
     """
-    یک فایل را به چند بخش با اندازه ZIP_PART_SIZE تقسیم می‌کند.
-    نام بخش‌ها: prefix.zip.001 و ... یا prefix.part001{ext} ...
-    """
-    logger = get_logger('utils.split_binary')
-    if not os.path.exists(file_path):
-        logger.error(f"فایل برای تقسیم وجود ندارد: {file_path}")
-        return []
-
-    dir_name = os.path.dirname(file_path)
-    chunks = []
-    try:
-        with open(file_path, 'rb') as f:
-            part_num = 0
-            while True:
-                chunk = f.read(settings.ZIP_PART_SIZE)
-                if not chunk:
-                    break
-                part_num += 1
-                if ext == '.zip':
-                    chunk_name = f"{prefix}.zip.{part_num:03d}"
-                else:
-                    chunk_name = f"{prefix}.part{part_num:03d}{ext}"
-                chunk_path = os.path.join(dir_name, chunk_name)
-                with open(chunk_path, 'wb') as cf:
-                    cf.write(chunk)
-                chunks.append(chunk_path)
-                logger.debug(f"بخش {part_num} ایجاد شد: {chunk_path}")
-        logger.info(f"فایل {file_path} به {len(chunks)} بخش تقسیم شد.")
-    except Exception as e:
-        logger.exception(f"خطا در تقسیم فایل {file_path}: {e}")
-        return []
-    return chunks
-
-# ═══════════════════════════════════════════════════════════
-# تقسیم ویدئو به بخش‌های قابل پخش با FFmpeg (زمانی)
-# ═══════════════════════════════════════════════════════════
-def split_video_playable(video_path: str, output_dir: str, segment_duration: int = 60) -> List[str]:
-    """
-    با استفاده از FFmpeg ویدئو را به قطعات MP4 قابل پخش تقسیم می‌کند (بر اساس زمان).
-    هر بخش یک فایل ویدئویی مستقل است.
-    """
-    logger = get_logger('utils.split_video_playable')
-    if not os.path.exists(video_path):
-        logger.error(f"فایل ویدئو یافت نشد: {video_path}")
-        return []
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # الگوی نام برای خروجی
-    output_pattern = os.path.join(output_dir, "chunk_%03d.mp4")
-
-    cmd = [
-        settings.FFMPEG_PATH,
-        '-y',                                   # overwrite output files
-        '-i', video_path,
-        '-c', 'copy',                           # stream copy (بدون رمزگذاری مجدد)
-        '-map', '0',                            # همه stream ها
-        '-f', 'segment',
-        '-segment_time', str(segment_duration),
-        '-reset_timestamps', '1',
-        output_pattern
-    ]
-
-    logger.info(f"در حال تقسیم ویدئو (زمانی): {' '.join(cmd)}")
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg با خطا مواجه شد (کد {e.returncode}): {e.stderr}")
-        return []
-
-    # پیدا کردن همه فایل‌های chunk تولید شده
-    chunk_files = []
-    for fname in sorted(os.listdir(output_dir)):
-        if re.match(r'^chunk_\d{3}\.mp4$', fname):
-            chunk_files.append(os.path.join(output_dir, fname))
-    if not chunk_files:
-        logger.warning("FFmpeg هیچ قطعه‌ای تولید نکرد.")
-    else:
-        logger.info(f"{len(chunk_files)} قطعه ویدئو در {output_dir} ایجاد شد.")
-    return chunk_files
-
-# ═══════════════════════════════════════════════════════════
-# تقسیم ویدئو به قطعات قابل پخش با محدودیت حجم (split_video_by_size)
-# ═══════════════════════════════════════════════════════════
-def split_video_by_size(
-    video_path: str,
-    output_dir: str,
-    max_size_bytes: int = 19 * 1024 * 1024
-) -> List[str]:
-    """
-    تقسیم یک فایل ویدئو به قطعات قابل پخش MP4 که حجم هرکدام حداکثر max_size_bytes باشد.
-    از روش تقسیم زمانی تقریبی (با فرض توزیع یکنواخت بیت‌ریت) استفاده می‌کند.
+    تقسیم فایل باینری به قطعه‌های با اندازه‌ی ZIP_PART_SIZE.
 
     Args:
-        video_path: مسیر فایل ویدئوی اصلی.
-        output_dir: دایرکتوری خروجی برای قطعات.
-        max_size_bytes: حداکثر حجم مجاز برای هر قطعه (پیش‌فرض 19 مگابایت).
+        file_path: مسیر فایل اصلی.
+        prefix: پیشوند نام قطعه‌ها.
+        ext: پسوند اصلی فایل (مثلاً .mp4 یا .zip).
 
     Returns:
-        لیست مرتب‌شده از مسیرهای کامل قطعات تولیدشده. در صورت خطا یا عدم موفقیت، لیست خالی.
+        لیست مسیرهای کامل قطعه‌های ساخته‌شده.
+    """
+    part_paths = []
+    part_size = settings.ZIP_PART_SIZE
+    output_dir = os.path.dirname(file_path) or '.'
+
+    if ext == '.zip':
+        name_pattern = f"{prefix}.zip.{{:03d}}"
+    else:
+        # برای فایل‌های غیر zip : prefix.part001.ext
+        name_pattern = f"{prefix}.part{{:03d}}{ext}"
+
+    with open(file_path, 'rb') as f:
+        part_num = 1
+        while True:
+            chunk = f.read(part_size)
+            if not chunk:
+                break
+            part_name = name_pattern.format(part_num)
+            part_path = os.path.join(output_dir, part_name)
+            with open(part_path, 'wb') as part_file:
+                part_file.write(chunk)
+            part_paths.append(part_path)
+            part_num += 1
+
+    return part_paths
+
+
+def merge_file_parts(parts: List[str], output_path: str) -> None:
+    """
+    الحاق قطعات یک فایل و ساخت فایل نهایی.
+
+    Args:
+        parts: لیست مسیر قطعات به ترتیب.
+        output_path: مسیر فایل خروجی.
+    """
+    with open(output_path, 'wb') as out_f:
+        for part_path in parts:
+            with open(part_path, 'rb') as in_f:
+                out_f.write(in_f.read())
+
+
+def split_video_by_size(video_path: str, max_size_bytes: int = 19 * 1024 * 1024) -> List[str]:
+    """
+    تقسیم ویدئو به قطعات قابل پخش MP4 با حداکثر حجم مشخص.
+    از ffprobe برای محاسبهٔ مدت زمان و از ffmpeg برای تقسیم استفاده می‌کند.
+    خروجی در همان پوشهٔ ویدیوی اصلی قرار می‌گیرد.
     """
     logger = get_logger('utils.split_video_by_size')
     if not os.path.exists(video_path):
         logger.error(f"فایل ویدئو یافت نشد: {video_path}")
         return []
 
-    os.makedirs(output_dir, exist_ok=True)
-
+    output_dir = os.path.dirname(video_path) or '.'
     total_size = os.path.getsize(video_path)
     if total_size <= max_size_bytes:
-        # فایل کوچک‌تر از حد مجاز - فقط کپی کن
         dest = os.path.join(output_dir, os.path.basename(video_path))
         shutil.copy2(video_path, dest)
-        logger.info(f"ویدئو بدون تقسیم (حجم {total_size} ≤ {max_size_bytes}) کپی شد: {dest}")
         return [dest]
 
-    # دریافت مدت زمان ویدئو با ffprobe
+    # دریافت مدت زمان با ffprobe
     ffprobe_cmd = [
         settings.FFMPEG_PATH.replace("ffmpeg", "ffprobe") if "ffmpeg" in settings.FFMPEG_PATH else "ffprobe",
         "-v", "error",
@@ -207,19 +154,14 @@ def split_video_by_size(
         logger.error(f"دریافت مدت زمان ویدئو با ffprobe ناموفق بود: {e}")
         return []
 
-    # محاسبه تعداد قطعات و مدت زمان تقریبی هر کدام
     num_chunks = math.ceil(total_size / max_size_bytes)
     chunk_duration = total_duration / num_chunks
-    logger.info(f"تقسیم ویدئو به {num_chunks} قطعه با مدت زمان ~{chunk_duration:.2f}s هرکدام")
 
-    # اجرای FFmpeg با segment_time
     output_pattern = os.path.join(output_dir, "chunk_%03d.mp4")
     cmd = [
         settings.FFMPEG_PATH,
-        "-y",
-        "-i", video_path,
-        "-c", "copy",
-        "-map", "0",
+        "-y", "-i", video_path,
+        "-c", "copy", "-map", "0",
         "-f", "segment",
         "-segment_time", str(chunk_duration),
         "-reset_timestamps", "1",
@@ -232,234 +174,221 @@ def split_video_by_size(
         logger.error(f"FFmpeg split by size با خطا مواجه شد: {e.stderr}")
         return []
 
-    # جمع‌آوری قطعات تولیدی
     chunk_files = []
     for fname in sorted(os.listdir(output_dir)):
         if re.match(r'^chunk_\d{3}\.mp4$', fname):
             chunk_files.append(os.path.join(output_dir, fname))
-    if not chunk_files:
-        logger.warning("split_video_by_size: هیچ قطعه‌ای تولید نشد.")
-    else:
-        logger.info(f"{len(chunk_files)} قطعه ویدئو با محدودیت حجم ایجاد شد.")
+    logger.info(f"{len(chunk_files)} قطعه ویدئو با محدودیت حجم ایجاد شد.")
     return chunk_files
 
-# ═══════════════════════════════════════════════════════════
-# دانلود فایل از اینترنت (با تلاش مجدد)
-# ═══════════════════════════════════════════════════════════
+
+def upload_manager(parts: List[str], chat_id: int, send_func: callable, state_file: str,
+                   max_retries: int = 3) -> bool:
+    """
+    مدیریت ارسال قطعات فایل به ترتیب با قابلیت ذخیره و بازیابی وضعیت.
+    """
+    state = load_json(state_file, {"sent": []})
+    sent = set(state.get("sent", []))
+    for idx, part_path in enumerate(parts):
+        if part_path in sent:
+            continue
+        for attempt in range(max_retries):
+            try:
+                send_func(chat_id, part_path, f"بخش {idx+1}/{len(parts)}")
+                sent.add(part_path)
+                save_json(state_file, {"sent": list(sent)})
+                break
+            except Exception:
+                time.sleep(2 * (attempt + 1))
+        else:
+            get_logger("upload_manager").error(f"ارسال {part_path} ناموفق ماند.")
+            return False
+    return True
+
+
+# ──────────────────────────── اعتبارسنجی URL و استخراج ID ──────────────────
+
+def is_valid_url(url: str) -> bool:
+    """بررسی آغاز URL با http:// یا https://"""
+    return url.startswith(('http://', 'https://'))
+
+
+def extract_video_id(url: str) -> Optional[str]:
+    """
+    استخراج شناسه‌ی ویدیو از URL یوتیوب.
+
+    از الگوهای رایج مانند watch?v=، youtu.be/، embed/، v/ پشتیبانی می‌کند.
+    """
+    if not url:
+        return None
+    # الگوی استاندارد
+    pattern = r'(?:v=|/)([0-9A-Za-z_-]{11})(?:[?&/#]|$)'
+    # بررسی مستقیم youtu.be
+    parsed = urlparse(url)
+    if parsed.netloc in ('youtu.be', 'www.youtu.be'):
+        vid = parsed.path.lstrip('/')
+        if re.match(r'^[0-9A-Za-z_-]{11}$', vid):
+            return vid
+    # جستجو با regex
+    match = re.search(pattern, url)
+    return match.group(1) if match else None
+
+
+def get_filename_from_url(url: str, default: str = "video") -> str:
+    """
+    استخراج نام فایل از انتهای مسیر URL.
+
+    Args:
+        url: آدرس فایل.
+        default: نام پیش‌فرض در صورت نامعتبر بودن.
+
+    Returns:
+        نام فایل استخراج‌شده یا پیش‌فرض.
+    """
+    try:
+        path = urlparse(url).path
+        name = os.path.basename(unquote(path))
+        if not name or '.' not in name:
+            return default
+        return name
+    except Exception:
+        return default
+
+
+# ──────────────────────────── دانلود با requests ──────────────────────────
+
 def download_file(url: str, save_dir: str, filename: Optional[str] = None,
-                  timeout: int = 120, max_retries: int = 3) -> Optional[str]:
+                  timeout: int = 60) -> Optional[str]:
     """
-    دانلود فایل از طریق HTTP GET با پشتیبانی از تلاش مجدد.
-    در صورت عدم ارائه نام، از مسیر URL استخراج می‌کند.
+    دانلود فایل از اینترنت و ذخیره در پوشه‌ی داده‌شده.
+
+    Args:
+        url: آدرس فایل.
+        save_dir: پوشه‌ی مقصد.
+        filename: نام فایل ذخیره (در صورت نبود از URL استخراج می‌شود).
+        timeout: تایم‌اوت دانلود.
+
+    Returns:
+        مسیر کامل فایل ذخیره‌شده یا None در صورت شکست.
     """
-    logger = get_logger('utils.download_file')
+    log = get_logger('download_file')
     os.makedirs(save_dir, exist_ok=True)
 
-    headers = {'User-Agent': settings.USER_AGENT}
-
-    # تعیین نام فایل
     if not filename:
-        parsed = urlparse(url)
-        filename = unquote(os.path.basename(parsed.path))
-        if not filename:
-            filename = 'downloaded_file'
-
-    # جلوگیری از بازنویسی فایل‌ها
+        filename = get_filename_from_url(url, default='downloaded_file')
+    # جلوگیری از بازنویسی فایل موجود
     base, ext = os.path.splitext(filename)
-    dest_path = os.path.join(save_dir, filename)
     counter = 1
+    dest_path = os.path.join(save_dir, filename)
     while os.path.exists(dest_path):
         dest_path = os.path.join(save_dir, f"{base}_{counter}{ext}")
         counter += 1
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"دانلود {url} (تلاش {attempt}/{max_retries})")
-            resp = requests.get(url, headers=headers, stream=True, timeout=timeout)
-            resp.raise_for_status()
-
+    headers = {'User-Agent': settings.USER_AGENT}
+    try:
+        with requests.get(url, stream=True, timeout=timeout, headers=headers) as r:
+            r.raise_for_status()
             with open(dest_path, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            logger.info(f"فایل با موفقیت دانلود شد: {dest_path}")
-            return dest_path
-        except Exception as e:
-            logger.warning(f"دانلود شکست خورد: {e}")
-            if attempt < max_retries:
-                sleep_time = 2 ** attempt
-                logger.info(f"تلاش مجدد پس از {sleep_time} ثانیه...")
-                time.sleep(sleep_time)
-            else:
-                logger.error(f"دانلود پس از {max_retries} تلاش ناموفق ماند.")
-    return None
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        log.info(f"دانلود موفق: {url} -> {dest_path}")
+        return dest_path
+    except Exception as e:
+        log.error(f"خطا در دانلود {url}: {e}")
+        return None
 
-# ═══════════════════════════════════════════════════════════
-# درخواست امن HTTP
-# ═══════════════════════════════════════════════════════════
+
 def safe_request(url: str, timeout: Optional[int] = None) -> Optional[requests.Response]:
     """
-    یک درخواست GET ساده با User-Agent و حداکثر 2 تلاش انجام می‌دهد.
-    """
-    logger = get_logger('utils.safe_request')
-    if timeout is None:
-        timeout = settings.REQUEST_TIMEOUT
+    درخواست GET با دو بار تلاش و مدیریت خطا.
 
+    Args:
+        url: آدرس درخواست.
+        timeout: تایم‌اوت (در صورت None از settings.REQUEST_TIMEOUT استفاده می‌شود).
+
+    Returns:
+        شیء Response یا None.
+    """
+    log = get_logger('safe_request')
+    timeout = timeout or settings.REQUEST_TIMEOUT
     headers = {'User-Agent': settings.USER_AGENT}
-    for attempt in range(2):
+    retries = 2
+    for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp = requests.get(url, timeout=timeout, headers=headers)
             resp.raise_for_status()
             return resp
         except Exception as e:
-            logger.warning(f"درخواست ناموفق (تلاش {attempt+1}): {e}")
-            if attempt == 0:
-                time.sleep(2)
+            log.warning(f"تلاش {attempt}/{retries} برای {url} شکست خورد: {e}")
+            time.sleep(1)
+    log.error(f"تمام تلاش‌ها برای {url} شکست خورد.")
     return None
 
-# ═══════════════════════════════════════════════════════════
-# ابزارهای JSON
-# ═══════════════════════════════════════════════════════════
-def load_json(file_path: str, default=None) -> dict:
+
+# ──────────────────────────── ابزارهای JSON ──────────────────────────────
+
+def load_json(file_path: str, default: Optional[Dict] = None) -> Dict:
     """
-    بارگذاری فایل JSON. در صورت عدم وجود یا خرابی، مقدار پیش‌فرض را برمی‌گرداند.
+    بارگذاری محتوای فایل JSON.
+
+    Args:
+        file_path: مسیر فایل.
+        default: مقدار پیش‌فرض در صورت نبودن فایل یا خطا.
+
+    Returns:
+        دیکشنری حاصل.
     """
-    logger = get_logger('utils.json')
+    log = get_logger('load_json')
     if default is None:
         default = {}
     if not os.path.exists(file_path):
         return default
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        logger.debug(f"فایل JSON بارگذاری شد: {file_path}")
-        return data
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError) as e:
+        log.error(f"خطا در خواندن JSON از {file_path}: {e}")
+        return default
     except Exception as e:
-        logger.warning(f"خطا در بارگذاری JSON از {file_path}: {e}")
+        log.error(f"خطای غیرمنتظره {file_path}: {e}")
         return default
 
-def save_json(file_path: str, data: dict) -> None:
+
+def save_json(file_path: str, data: Dict) -> None:
     """
-    ذخیره امن JSON با نوشتن در فایل موقت و سپس جایگزینی.
+    ذخیره دیکشنری در فایل JSON به صورت اتمیک و غیرهمزمان.
+    در صورت هنگ کردن فایل‌سیستم، عملیات حداکثر ۵ ثانیه صبر می‌کند.
     """
-    logger = get_logger('utils.json')
-    os.makedirs(os.path.dirname(file_path) or '.', exist_ok=True)
-    temp_path = file_path + ".tmp"
+    log = get_logger('save_json')
+    temp_path = file_path + '.tmp'
     try:
+        os.makedirs(os.path.dirname(file_path) or '.', exist_ok=True)
         with open(temp_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(temp_path, file_path)  # عملیات اتمیک روی اکثر سیستم‌ها
-        logger.debug(f"JSON ذخیره شد: {file_path}")
-    except Exception as e:
-        logger.error(f"خطا در ذخیره JSON در {file_path}: {e}")
 
-# ═══════════════════════════════════════════════════════════
-# استخراج شناسه ویدئو از URL
-# ═══════════════════════════════════════════════════════════
-def extract_video_id(url: str) -> Optional[str]:
-    """
-    استخراج YouTube video ID از URL‌های استاندارد.
-    بازگشت None در صورت عدم تطبیق.
-    """
-    pattern = (
-        r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/v/)'
-        r'([a-zA-Z0-9_-]{11})'
-    )
-    match = re.search(pattern, url)
-    if match:
-        return match.group(1)
-    return None
+        # اجرای os.replace در یک ترد جداگانه با timeout
+        def replace_operation():
+            os.replace(temp_path, file_path)
 
-# ═══════════════════════════════════════════════════════════
-# مدیریت هوشمند آپلود با ذخیره وضعیت و تلاش مجدد
-# ═══════════════════════════════════════════════════════════
-def upload_manager(file_parts: List[str],
-                   chat_id: int,
-                   send_func: Callable[[int, str, str], bool],
-                   state_file: Optional[str] = None,
-                   max_retries: int = 3) -> bool:
-    """
-    ارسال لیستی از فایل‌ها به کاربر به ترتیب، همراه با تلاش مجدد و ذخیره وضعیت.
-    send_func(chat_id, file_path, caption) -> bool
-    """
-    logger = get_logger('utils.upload_manager')
+        t = threading.Thread(target=replace_operation, daemon=True)
+        t.start()
+        t.join(timeout=5)
 
-    # بارگذاری یا ایجاد وضعیت
-    state = {}
-    if state_file:
-        state = load_json(state_file, {})
-        if 'parts' not in state:
-            state['parts'] = []
-
-    # تطبیق فایل‌های ورودی با وضعیت (در صورت لزوم)
-    if state and state['parts']:
-        logger.info(f"وضعیت آپلود قبلی بارگذاری شد: {len(state['parts'])} بخش.")
-    else:
-        # ایجاد entries جدید
-        state['parts'] = [{'path': p, 'sent': False, 'retries': 0} for p in file_parts]
-        if state_file:
-            save_json(state_file, state)
-
-    total = len(state['parts'])
-    for idx, part_info in enumerate(state['parts']):
-        if part_info['sent']:
-            logger.info(f"بخش {idx+1}/{total} قبلاً ارسال شده، رد می‌شود.")
-            continue
-
-        file_path = part_info['path']
-        if not os.path.exists(file_path):
-            logger.warning(f"فایل بخش وجود ندارد: {file_path}. علامت‌گذاری به عنوان ارسال‌شده.")
-            part_info['sent'] = True
-            if state_file:
-                save_json(state_file, state)
-            continue
-
-        caption = f"📦 بخش {idx+1} از {total}"
-        success = False
-        while part_info['retries'] < max_retries:
-            try:
-                logger.debug(f"تلاش ارسال بخش {idx+1} (تلاش {part_info['retries']+1})")
-                ok = send_func(chat_id, file_path, caption)
-                if ok:
-                    logger.info(f"بخش {idx+1} با موفقیت ارسال شد.")
-                    success = True
-                    break
-                else:
-                    logger.warning(f"ارسال بخش {idx+1} با شکست روبرو شد (بازگشت False).")
-            except Exception as e:
-                logger.error(f"خطا در ارسال بخش {idx+1}: {e}")
-
-            part_info['retries'] += 1
-            if state_file:
-                save_json(state_file, state)
-            if part_info['retries'] < max_retries:
-                time.sleep(3)  # مکث قبل از تلاش مجدد
-
-        if success:
-            part_info['sent'] = True
-            # تلاش برای حذف فایل
-            safe_remove(file_path)
-            if state_file:
-                save_json(state_file, state)
+        if t.is_alive():
+            log.warning(f"ذخیره JSON برای {file_path} بیش از ۵ ثانیه طول کشید - نادیده گرفته شد")
         else:
-            logger.critical(f"بخش {idx+1} پس از {max_retries} تلاش ارسال نشد. آپلود ناقص ماند.")
-            return False
+            # در صورت موفقیت، t.is_alive() == False
+            pass  # موفقیت در لاگ ذخیره نمی‌شود؛ می‌توان اضافه کرد
+    except Exception as e:
+        log.error(f"خطا در ذخیره JSON در {file_path}: {e}")
 
-    logger.info("همه بخش‌ها با موفقیت ارسال شدند.")
-    # پاک کردن فایل وضعیت
-    if state_file and os.path.exists(state_file):
-        try:
-            os.remove(state_file)
-        except Exception:
-            pass
-    return True
 
-# ═══════════════════════════════════════════════════════════
-# حذف ایمن فایل
-# ═══════════════════════════════════════════════════════════
 def safe_remove(file_path: str) -> None:
-    """حذف فایل در صورت وجود، بدون ایجاد خطا."""
+    """حذف یک فایل در صورت وجود بدون ایجاد خطا."""
+    log = get_logger('safe_remove')
     try:
         if os.path.exists(file_path):
             os.remove(file_path)
     except Exception as e:
-        get_logger('utils.safe_remove').warning(f"حذف فایل {file_path} ناموفق: {e}")
+        log.error(f"خطا در حذف فایل {file_path}: {e}")
