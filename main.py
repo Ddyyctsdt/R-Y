@@ -2,6 +2,7 @@
 main.py - حلقه اصلی ربات YouTube Bale Bot (نسخه ۳)
 رفع باگ‌های ارسال سند، تحویل نتایج جستجو، پاسخ کال‌بک تکراری و مدیریت upload
 اضافه شدن timeout برای عملیات‌ها، فرمان /channel، پایداری worker و محافظت در برابر هنگ
+به‌روزرسانی برای جستجوی دو مرحله‌ای: scrapetube + scrape_watch
 """
 
 import os
@@ -249,10 +250,6 @@ def build_settings_menu() -> Dict:
     return {"inline_keyboard": keyboard}
 
 def build_method_chain_keyboard(category: str, method_config: Dict[str, Any]) -> Dict:
-    """
-    ساخت کیبورد برای فعال/غیرفعال کردن متدهای یک زنجیره.
-    category: 'search' یا 'download'
-    """
     chain = method_config.get(f"{category}_chain", [])
     if category == "search":
         methods = settings.SEARCH_METHODS
@@ -312,7 +309,7 @@ def enqueue_job(job: Dict[str, Any]) -> None:
     _log.info(f"وظیفه {job['job_id']} ({job.get('command')}) اضافه شد.")
 
 def process_job(job: Dict[str, Any]) -> None:
-    """پردازش یک وظیفه از صف (بدون لاگ‌های تکراری شروع/پایان)"""
+    """پردازش یک وظیفه از صف"""
     command = job.get("command")
     params = job.get("params", {})
     chat_id = job.get("chat_id")
@@ -324,50 +321,74 @@ def process_job(job: Dict[str, Any]) -> None:
         if command == "search":
             query = params.get("query", "")
             limit = params.get("limit", 10)
-            config = load_method_config()
-            search_mode = config.get("search_mode", "browser")
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    youtube_core.search_youtube, query=query, limit=limit, mode=search_mode
-                )
-                try:
-                    results, method_used = future.result(timeout=settings.SEARCH_TIMEOUT)
-                except concurrent.futures.TimeoutError:
-                    _log.warning(f"جستجو برای '{query}' بیش از {settings.SEARCH_TIMEOUT}s طول کشید.")
-                    send_message(chat_id, f"⏰ جستجو زمان‌بر شد. لطفاً دوباره تلاش کنید.")
-                    return
-                except Exception as e:
-                    _log.exception(f"خطا در جستجو: {e}")
-                    send_message(chat_id, f"⛔ خطا در جستجو: {str(e)[:200]}")
-                    return
-
+            # جستجوی سریع با scrapetube
+            results, method_used = youtube_core.search_youtube(query, limit=limit)
             if not results:
                 send_message(chat_id, "🔎 نتیجه‌ای یافت نشد.")
                 return
 
-            try:
-                register_videos_from_search(results)
-                lines = [f"🔍 نتایج جستجو برای: {query} (روش: {method_used})"]
-                for idx, v in enumerate(results, 1):
-                    title = v.get("title", "بی‌نام")[:40]
-                    duration = v.get("duration", "?")
-                    lines.append(f"{idx}️⃣ {title} | ⏱ {duration}")
-                    lines.append(f"   📋 /H{idx}   📥 /Download_{idx}")
-                message_text = "\n".join(lines)
-                send_message(chat_id, message_text)
-            except Exception as e:
-                _log.exception("خطا در ثبت/ارسال نتایج جستجو؛ ارسال پیام ساده.")
-                simple_lines = [f"نتایج برای {query} (روش: {method_used})"]
-                for v in results:
-                    simple_lines.append(f"{v.get('title','?')} - {v.get('video_id')}")
-                send_message(chat_id, "\n".join(simple_lines))
+            # ثبت فوری ویدیوها برای دستورات /H و /Download
+            register_videos_from_search(results)
 
+            # ذخیره آخرین جستجو
             save_last_search({
                 "results": results,
                 "query": query,
-                "method": method_used,
+                "method": method_used or "scrapetube",
             })
+
+            # ارسال پیام سرآیند و درخواست استخراج جزئیات برای هر ویدیو
+            send_message(chat_id, f"🔍 {len(results)} نتیجه پیدا شد. اطلاعات در حال دریافت...")
+            for idx, v in enumerate(results, 1):
+                vid = v.get("video_id")
+                if vid:
+                    enqueue_job({
+                        "command": "scrape_watch",
+                        "params": {"video_id": vid, "index": idx},
+                        "chat_id": chat_id
+                    })
+
+        elif command == "scrape_watch":
+            video_id = params.get("video_id")
+            index = params.get("index", "?")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(youtube_core.scrape_watch_page, video_id)
+                try:
+                    info = future.result(timeout=20)
+                except concurrent.futures.TimeoutError:
+                    send_message(chat_id, f"⚠️ اطلاعات ویدیوی {index} دریافت نشد. شناسه: {video_id}")
+                    return
+                except Exception as e:
+                    _log.exception(f"scrape_watch error for {video_id}: {e}")
+                    send_message(chat_id, f"⚠️ خطا در دریافت اطلاعات ویدیوی {index}: {str(e)[:200]}")
+                    return
+
+            if not info or not info.get("title"):
+                send_message(chat_id, f"⚠️ اطلاعات ویدیوی {index} دریافت نشد. شناسه: {video_id}")
+                return
+
+            # دانلود و ارسال تامنیل
+            try:
+                thumb_path, _ = youtube_core.download_thumbnail(video_id, job_folder)
+                if thumb_path:
+                    send_document(chat_id, thumb_path, caption=f"{info['title']} (اسکرپ)")
+                    try:
+                        os.remove(thumb_path)
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
+            desc = (info.get("description") or "")[:300]
+            msg = (
+                f"📹 {info.get('title')}\n"
+                f"👤 {info.get('uploader', '؟')}\n"
+                f"👁 {info.get('view_count', '؟')} | ⏱ {info.get('duration', '؟')} ثانیه\n"
+                f"📝 {desc}\n"
+                f"🔗 https://youtube.com/watch?v={video_id}\n"
+                f"📥 /Download_{index}"
+            )
+            send_message(chat_id, msg)
 
         elif command == "info":
             video_id = params.get("video_id")
@@ -405,11 +426,12 @@ def process_job(job: Dict[str, Any]) -> None:
             except Exception as e:
                 _log.warning(f"خطای دانلود تامنیل: {e}")
 
+            desc = (info_dict.get("description") or "")[:200]
             msg = (
                 f"📹 {info_dict.get('title')}\n"
                 f"👤 {info_dict.get('author', '؟')}\n"
                 f"👁 {info_dict.get('view_count', '؟')} | ⏱ {info_dict.get('duration', '؟')} ثانیه\n"
-                f"📝 {info_dict.get('description', '' )[:200]}\n\n"
+                f"📝 {desc}\n\n"
                 f"🔗 https://youtube.com/watch?v={video_id}\n"
                 f"🧩 روش: {method_used}"
             )
@@ -530,15 +552,12 @@ def process_job(job: Dict[str, Any]) -> None:
         _log.exception(f"خطا در پردازش وظیفه {job_id}: {e}")
         send_message(chat_id, f"⛔ خطایی رخ داد: {str(e)[:200]}")
     finally:
-        # پاکسازی پوشه موقت
         try:
             if os.path.exists(job_folder) and not os.listdir(job_folder):
                 os.rmdir(job_folder)
         except Exception:
             pass
 
-
-# ════════════════ اجرای وظیفه با محافظت در برابر هنگ ════════════════
 
 def run_job_with_timeout(job: dict, timeout_seconds: int) -> Optional[Exception]:
     """
@@ -565,8 +584,6 @@ def run_job_with_timeout(job: dict, timeout_seconds: int) -> Optional[Exception]
     return exception_occurred
 
 
-# ════════════════ کارگر صف (نسخه مقاوم به هنگ) ════════════════
-
 def worker_loop() -> None:
     """حلقه کارگر صف با محافظت در برابر خرابی و هنگ"""
     _log.info("کارگر صف آغاز به کار کرد.")
@@ -586,8 +603,16 @@ def worker_loop() -> None:
         command = job.get('command', '?')
         chat_id = job.get('chat_id')
 
-        _log.info(f"شروع پردازش {job_id} ({command})")
-        err = run_job_with_timeout(job, settings.SEARCH_TIMEOUT + 10)   # ۳۵ ثانیه
+        # انتخاب timeout بر اساس نوع دستور
+        if command == "scrape_watch":
+            outer_timeout = 20
+        elif command == "download":
+            outer_timeout = 60
+        else:
+            outer_timeout = settings.SEARCH_TIMEOUT + 10   # ۳۵ ثانیه پیش‌فرض
+
+        _log.info(f"شروع پردازش {job_id} ({command}) با timeout {outer_timeout}s")
+        err = run_job_with_timeout(job, outer_timeout)
 
         if err is None:
             _log.info(f"پایان وظیفه {job_id}")
