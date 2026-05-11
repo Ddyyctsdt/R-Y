@@ -1,6 +1,7 @@
 """
 youtube_core.py – هستهٔ عملیات یوتیوب (نسخهٔ ۳)
-جستجوی مرورگر، دریافت اطلاعات، دانلود ویدیو، پیمایش کانال و متدهای fallback
+جستجوی سریع با scrapetube، دریافت اطلاعات کامل از صفحه تماشا (Playwright)،
+دانلود ویدیو، عملیات کانال و متدهای fallback
 """
 
 import json
@@ -17,84 +18,8 @@ from utils import get_logger, download_file
 
 _log = get_logger("youtube_core")
 
-# ──────────────────────────── مدیریت مرورگر ────────────────────────────
-_browser = None
-_playwright = None
-
-def _get_browser():
-    """راه‌اندازی یا بازیابی نمونهٔ مشترک مرورگر (Chromium)"""
-    global _browser, _playwright
-    if _browser is None or not _browser.is_connected():
-        if _playwright is None:
-            _playwright = sync_playwright().start()
-        _browser = _playwright.chromium.launch(headless=True)
-    return _browser
-
-def _close_browser():
-    global _browser, _playwright
-    if _browser:
-        _browser.close()
-        _browser = None
-    if _playwright:
-        _playwright.stop()
-        _playwright = None
 
 # ──────────────────────────── ابزارهای کمکی ────────────────────────────
-
-def _parse_innertube_renderer(data: dict, limit: int = 10) -> List[Dict[str, Any]]:
-    """تبدیل rendererهای innertube/ytInitialData به لیست استاندارد"""
-    results = []
-    contents = []
-    try:
-        primary = (data.get("contents", {})
-                       .get("twoColumnSearchResultsRenderer", {})
-                       .get("primaryContents", {})
-                       .get("sectionListRenderer", {})
-                       .get("contents", []))
-        for section in primary:
-            items = section.get("itemSectionRenderer", {}).get("contents", [])
-            contents.extend(items)
-        if not contents:
-            rich = (data.get("contents", {})
-                        .get("twoColumnSearchResultsRenderer", {})
-                        .get("primaryContents", {})
-                        .get("richGridRenderer", {})
-                        .get("contents", []))
-            for item in rich:
-                video = item.get("richItemRenderer", {}).get("content", {}).get("videoRenderer")
-                if video:
-                    contents.append({"videoRenderer": video})
-
-        for item in contents:
-            if len(results) >= limit:
-                break
-            video = item.get("videoRenderer")
-            if not video:
-                continue
-            vid = video.get("videoId")
-            if not vid:
-                continue
-            title = "".join(run.get("text", "") for run in video.get("title", {}).get("runs", []))
-            thumbs = video.get("thumbnail", {}).get("thumbnails", [])
-            thumb_url = thumbs[0]["url"] if thumbs else None
-            duration = video.get("lengthText", {}).get("simpleText", "")
-            uploader = video.get("ownerText", {}).get("runs", [{"text": ""}])[0].get("text", "")
-            views = video.get("viewCountText", {}).get("simpleText") or video.get("shortViewCountText", {}).get("simpleText", "")
-            uploaded = video.get("publishedTimeText", {}).get("simpleText", "")
-
-            results.append({
-                "video_id": vid,
-                "title": title or None,
-                "thumbnail_url": thumb_url,
-                "duration": duration,
-                "uploader": uploader or None,
-                "views": views or None,
-                "uploaded": uploaded or None,
-            })
-    except Exception as e:
-        _log.warning(f"خطا در تجزیه renderer: {e}")
-    return results
-
 
 def _extract_video_id_from_url(url: str) -> Optional[str]:
     pattern = r'(?:v=|/)([0-9A-Za-z_-]{11})(?:[?&/#]|$)'
@@ -137,90 +62,7 @@ def run_with_fallback(
     return None, None
 
 
-# ──────────────────────────── جستجوی مرورگر (بهبودیافته) ─────────────────────
-
-def _search_browser(query: str, limit: int) -> Optional[List[Dict[str, Any]]]:
-    """
-    جستجوی یوتیوب با Playwright و استخراج داده‌ها ابتدا از ytInitialData،
-    سپس با DOM به‌عنوان پشتیبان.
-    """
-    browser = _get_browser()
-    page = None
-    try:
-        page = browser.new_page()
-        page.set_default_timeout(settings.SEARCH_TIMEOUT * 1000)
-
-        url = f"https://www.youtube.com/results?search_query={requests.utils.quote(query)}"
-        page.goto(url, wait_until="domcontentloaded")
-
-        try:
-            page.wait_for_selector('ytd-video-renderer', timeout=15000)
-        except PlaywrightTimeout:
-            _log.warning("زمان انتظار برای ytd-video-renderer تمام شد، ۵ ثانیه توقف اضافی...")
-            page.wait_for_timeout(5000)
-
-        html = page.content()
-        match = re.search(r'var\s+ytInitialData\s*=\s*(\{.+?\});', html, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group(1))
-                results = _parse_innertube_renderer(data, limit)
-                if results:
-                    return results
-            except Exception as e:
-                _log.warning(f"پارسه ytInitialData ناموفق: {e}")
-
-        # روش DOM (پشتیبان)
-        js_code = """
-        () => {
-            const items = document.querySelectorAll('ytd-video-renderer, ytd-rich-item-renderer');
-            const results = [];
-            for (const item of items) {
-                const titleEl = item.querySelector('#video-title, .ytd-video-renderer #video-title');
-                const linkEl = titleEl ? titleEl.querySelector('a') : null;
-                const href = linkEl ? linkEl.getAttribute('href') : '';
-                const videoId = href.split('?v=')[1]?.split('&')[0] || '';
-                const title = titleEl ? titleEl.textContent.trim() : '';
-                const thumbEl = item.querySelector('img.yt-core-image, #img');
-                const thumb = thumbEl ? thumbEl.getAttribute('src') : '';
-                const durationEl = item.querySelector('ytd-thumbnail-overlay-time-status-renderer span, .ytd-thumbnail-overlay-time-status-renderer');
-                const duration = durationEl ? durationEl.textContent.trim() : '';
-                const channelEl = item.querySelector('ytd-channel-name a, .ytd-channel-name a');
-                const channel = channelEl ? channelEl.textContent.trim() : '';
-                const metaLine = item.querySelector('#metadata-line, .inline-metadata');
-                const metaSpans = metaLine ? metaLine.querySelectorAll('span') : [];
-                const views = metaSpans.length >= 1 ? metaSpans[0].textContent.trim() : '';
-                const uploaded = metaSpans.length >= 2 ? metaSpans[1].textContent.trim() : '';
-                results.push({videoId, title, thumbnail, duration, channel, views, uploaded});
-            }
-            return results;
-        }
-        """
-        dom_results = page.evaluate(js_code)
-        formatted = []
-        for r in dom_results:
-            vid = r.get("videoId")
-            if not vid or len(vid) != 11:
-                continue
-            formatted.append({
-                "video_id": vid,
-                "title": r.get("title"),
-                "thumbnail_url": r.get("thumbnail"),
-                "duration": r.get("duration"),
-                "uploader": r.get("channel"),
-                "views": r.get("views"),
-                "uploaded": r.get("uploaded"),
-            })
-            if len(formatted) >= limit:
-                break
-        return formatted if formatted else None
-    except Exception as e:
-        _log.warning(f"خطا در جستجوی مرورگر: {e}")
-        return None
-    finally:
-        if page:
-            page.close()
-
+# ──────────────────────────── جستجوی سریع (فقط scrapetube) ─────────────────
 
 def _search_scrapetube(query: str, limit: int) -> Optional[List[Dict[str, Any]]]:
     """جستجو با کتابخانه scrapetube (فقط شناسه برمی‌گرداند)"""
@@ -262,118 +104,138 @@ def _enrich_oembed(video_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _enrich_json_ld(video_id: str) -> Optional[Dict[str, Any]]:
-    try:
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        headers = {"User-Agent": settings.USER_AGENT}
-        resp = requests.get(url, timeout=settings.REQUEST_TIMEOUT, headers=headers)
-        resp.raise_for_status()
-        match = re.search(r'<script type="application/ld\+json">(.*?)</script>', resp.text, re.DOTALL)
-        if not match:
-            return None
-        data = json.loads(match.group(1))
-        for item in data if isinstance(data, list) else [data]:
-            if item.get("@type") == "VideoObject":
-                return {
-                    "title": item.get("name"),
-                    "duration": item.get("duration"),
-                    "views": item.get("interactionStatistic"),
-                    "thumbnail": item.get("thumbnailUrl"),
-                    "author": item.get("author", {}).get("name") if isinstance(item.get("author"), dict) else None,
-                }
-        return None
-    except Exception:
-        return None
-
-
-def _enrich_dom_watch_page(video_id: str) -> Optional[Dict[str, Any]]:
-    """استخراج اطلاعات از صفحه تماشا با Playwright"""
-    browser = _get_browser()
+def scrape_watch_page(video_id: str) -> Optional[Dict[str, Any]]:
+    """
+    باز کردن صفحه تماشای یوتیوب با Playwright (نمونه جدید) و استخراج کامل داده‌ها.
+    """
+    _log.info(f"scrape_watch_page: {video_id}")
+    pw = None
+    browser = None
+    context = None
     page = None
     try:
-        page = browser.new_page()
-        page.goto(f"https://www.youtube.com/watch?v={video_id}", wait_until="domcontentloaded", timeout=settings.REQUEST_TIMEOUT*1000)
-        page.wait_for_selector("h1 yt-formatted-string", timeout=10000)
-        js = """
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=settings.USER_AGENT,
+            viewport={"width": 390, "height": 844}
+        )
+        page = context.new_page()
+        page.goto(f"https://www.youtube.com/watch?v={video_id}", wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_selector("h1 yt-formatted-string", timeout=15000)
+
+        # کلیک روی "Show more" برای دریافت توضیحات کامل
+        try:
+            expand_btn = page.query_selector("#expand, #description-inline-expander button")
+            if expand_btn:
+                expand_btn.click()
+                page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        js_code = """
         () => {
-            const title = document.querySelector('h1 yt-formatted-string')?.textContent || '';
-            const owner = document.querySelector('#owner yt-formatted-string a')?.textContent || '';
-            const views = document.querySelector('#count .view-count')?.textContent || '';
-            const date = document.querySelector('#info-strings yt-formatted-string')?.textContent || '';
-            return {title, owner, views, date};
+            const titleEl = document.querySelector('h1 yt-formatted-string');
+            const title = titleEl ? titleEl.textContent.trim() : '';
+            const uploaderEl = document.querySelector('#owner yt-formatted-string a, ytd-channel-name a');
+            const uploader = uploaderEl ? uploaderEl.textContent.trim() : '';
+            const viewsEl = document.querySelector('#info .view-count, #count .view-count');
+            const views = viewsEl ? viewsEl.textContent.trim() : '';
+            const duration = (() => {
+                try {
+                    const playerResponse = JSON.parse(document.querySelector('ytd-watch-flexy').getAttribute('ytd-watch-flexy'));
+                    return playerResponse?.args?.raw_player_response?.videoDetails?.lengthSeconds || '';
+                } catch(e) {}
+                return '';
+            })();
+            const descEl = document.querySelector('#description-inline-expander yt-formatted-string, #description yt-formatted-string');
+            const description = descEl ? descEl.textContent.trim() : '';
+            const likesEl = document.querySelector('#top-level-buttons-computed ytd-toggle-button-renderer:first-child #text, #segmented-like-button yt-button-shape button div[aria-label]');
+            const likes = likesEl ? likesEl.textContent.trim() : '';
+            const thumbUrl = document.querySelector('link[rel="shortcut icon"]')?.href || '';
+            return {
+                title, uploader, views, duration, description, likes, thumbUrl
+            };
         }
         """
-        data = page.evaluate(js)
+        data = page.evaluate(js_code)
         return {
-            "title": data.get("title"),
-            "author": data.get("owner"),
-            "views": data.get("views"),
-            "uploaded": data.get("date"),
+            "video_id": video_id,
+            "title": data.get("title") or None,
+            "duration": data.get("duration") or None,
+            "view_count": data.get("views") or None,
+            "like_count": data.get("likes") or None,
+            "thumbnail_url": data.get("thumbUrl") or f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+            "uploader": data.get("uploader") or None,
+            "description": data.get("description") or "",   # ← دیگر None نیست
         }
     except Exception as e:
-        _log.warning(f"enrich_dom_watch_page: {e}")
+        _log.warning(f"scrape_watch_page برای {video_id} شکست خورد: {e}")
         return None
     finally:
         if page:
             page.close()
+        if context:
+            context.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
 
 
 def enrich_video_info(video_id: str) -> Dict[str, Any]:
-    """تلاش برای پر کردن اطلاعات یک ویدیو با چند روش"""
-    info = {}
+    """تلاش برای دریافت اطلاعات کامل یک ویدیو با اولویت Playwright"""
+    info = scrape_watch_page(video_id)
+    if info and info.get("title"):
+        return info
+    # fallback به oembed
     oembed = _enrich_oembed(video_id)
     if oembed:
-        info.update(oembed)
-    jld = _enrich_json_ld(video_id)
-    if jld:
-        info.update({k: v for k, v in jld.items() if v is not None})
-    dom = _enrich_dom_watch_page(video_id)
-    if dom:
-        info.update({k: v for k, v in dom.items() if v is not None})
-    return info
+        return {
+            "video_id": video_id,
+            "title": oembed.get("title"),
+            "author": oembed.get("author"),
+            "thumbnail_url": oembed.get("thumbnail"),
+            "duration": None,
+            "view_count": None,
+            "like_count": None,
+            "uploader": oembed.get("author"),
+            "description": "",             # ← اضافه شد
+        }
+    return {}
 
 
 # ──────────────────────────── توابع عمومی جستجو و اطلاعات ────────────────
 
-def search_youtube(query: str, limit: int = 10, mode: str = "browser") -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def search_youtube(query: str, limit: int = 10, mode: str = "api") -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
-    جستجوی ویدیو. mode: 'browser' یا 'api' (scrapetube یا سایر)
+    جستجوی سریع ویدیوها فقط با scrapetube.
+    mode برای سازگاری باقی مانده ولی فقط حالت api پشتیبانی می‌شود.
     """
-    if mode == "api":
-        results = _search_scrapetube(query, limit)
-        return (results if results else [], "scrapetube")
-    # browser
-    chain = ["browser", "scrapetube"]
-    def _op(method: str, kwargs: dict) -> Optional[List[Dict]]:
-        q = kwargs["query"]
-        lim = kwargs["limit"]
-        if method == "browser":
-            return _search_browser(q, lim)
-        elif method == "scrapetube":
-            return _search_scrapetube(q, lim)
-        return None
-    results, method = run_with_fallback(chain, _op, query=query, limit=limit)
-    return (results if results else [], method if results else None)
+    results = _search_scrapetube(query, limit)
+    if results:
+        return results, "scrapetube"
+    return [], None
 
 
 def get_video_info(video_id: str) -> Tuple[Dict[str, Any], str]:
-    """دریافت اطلاعات کامل ویدیو (با enrich)"""
-    info = {
-        "title": None,
-        "author": None,
-        "duration": None,
-        "view_count": None,
-        "thumbnail": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
-        "description": None,
+    """دریافت اطلاعات کامل ویدیو از صفحه تماشا (Playwright)"""
+    info = enrich_video_info(video_id)
+    # تطبیق با ساختار قدیمی
+    result = {
+        "title": info.get("title"),
+        "author": info.get("author"),
+        "duration": info.get("duration"),
+        "view_count": info.get("view_count"),
+        "thumbnail": info.get("thumbnail_url") or f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+        "description": info.get("description") or "",   # ← تضمین رشته بودن
     }
-    enriched = enrich_video_info(video_id)
-    info.update(enriched)
-    if not info.get("title"):
+    # اگر خیلی خالی بود، fallback دیگه
+    if not result.get("title"):
         oembed = _enrich_oembed(video_id)
         if oembed:
-            info["title"] = oembed.get("title")
-    method = "enrich"
-    return info, method
+            result["title"] = oembed.get("title")
+    return result, "playwright_scrape"
 
 
 # ──────────────────────────── دانلود ویدیو ──────────────────────────────
@@ -502,12 +364,11 @@ def download_thumbnail(video_id: str, save_dir: str) -> Tuple[Optional[str], str
     return None, "direct"
 
 
-# ════════════════════ عملیات کانال (جدید) ════════════════════
+# ════════════════════ عملیات کانال ════════════════════
 
 def get_channel_videos(channel_id: str, sort_by: str = "newest", max_results: int = 50) -> Optional[List[Dict[str, Any]]]:
     """
     دریافت لیست ویدیوهای یک کانال یوتیوب.
-    🟢 اصلاح‌شده: استخراج فقط از DOM انجام می‌شود تا ویدیوهای بارگذاری‌شده با اسکرول پوشش داده شوند.
     """
     sort_suffix = {"newest": "", "oldest": "?sort=da", "popular": "?sort=p"}.get(sort_by, "")
     if channel_id.startswith("@"):
@@ -515,9 +376,12 @@ def get_channel_videos(channel_id: str, sort_by: str = "newest", max_results: in
     else:
         url = f"https://www.youtube.com/channel/{channel_id}/videos{sort_suffix}"
 
-    browser = _get_browser()
+    pw = None
+    browser = None
     page = None
     try:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
         page.set_default_timeout(settings.SEARCH_TIMEOUT * 1000)
         page.goto(url, wait_until="domcontentloaded")
@@ -527,7 +391,6 @@ def get_channel_videos(channel_id: str, sort_by: str = "newest", max_results: in
         except PlaywrightTimeout:
             page.wait_for_timeout(5000)
 
-        # اسکرول برای بارگذاری بیشتر
         collected = []
         no_new_count = 0
         while len(collected) < max_results and no_new_count < 2:
@@ -540,7 +403,6 @@ def get_channel_videos(channel_id: str, sort_by: str = "newest", max_results: in
             else:
                 no_new_count = 0
 
-        # استخراج DOM (روش اصلی)
         js_code = """
         () => {
             const items = document.querySelectorAll('ytd-rich-grid-media, ytd-video-renderer');
@@ -589,6 +451,10 @@ def get_channel_videos(channel_id: str, sort_by: str = "newest", max_results: in
     finally:
         if page:
             page.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
 
 
 def get_channel_info(channel_id: str) -> Optional[Dict[str, Any]]:
@@ -600,9 +466,12 @@ def get_channel_info(channel_id: str) -> Optional[Dict[str, Any]]:
     else:
         url = f"https://www.youtube.com/channel/{channel_id}/about"
 
-    browser = _get_browser()
+    pw = None
+    browser = None
     page = None
     try:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=settings.REQUEST_TIMEOUT*1000)
         html = page.content()
@@ -635,3 +504,7 @@ def get_channel_info(channel_id: str) -> Optional[Dict[str, Any]]:
     finally:
         if page:
             page.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
