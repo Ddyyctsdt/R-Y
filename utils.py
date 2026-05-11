@@ -369,6 +369,8 @@ def save_json(file_path: str, data: Dict) -> None:
 
         # اجرای os.replace در یک ترد جداگانه با timeout
         def replace_operation():
+            # تضمین وجود پوشه در لحظهٔ عملیات (ممکن است پاک شده باشد)
+            os.makedirs(os.path.dirname(file_path) or '.', exist_ok=True)
             os.replace(temp_path, file_path)
 
         t = threading.Thread(target=replace_operation, daemon=True)
