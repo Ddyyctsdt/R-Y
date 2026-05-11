@@ -19,8 +19,9 @@ REQUEST_TIMEOUT = 30          # ثانیه، تایم‌اوت درخواست‌
 LONG_POLL_TIMEOUT = 50        # ثانیه، تایم‌اوت long polling
 
 # ── timeout برای عملیات (ثانیه) ──
-SEARCH_TIMEOUT = 25            # حداکثر زمان برای جستجوی مرورگر (Playwright)
-INFO_TIMEOUT = 20              # حداکثر زمان برای دریافت اطلاعات ویدیو
+SEARCH_TIMEOUT = 90            # افزایش‌یافته برای رانرهای کند گیت‌هاب (حداکثر زمان جستجوی اولیه)
+INFO_TIMEOUT = 60              # افزایش‌یافته برای دریافت اطلاعات ویدیو
+WATCH_TIMEOUT = 60             # زمان scraping صفحه تماشا (scrape_watch)
 CHANNEL_VIDEOS_LIMIT = 50      # حداکثر تعداد ویدیوهای استخراج‌شده از کانال
 BROWSER_IDLE_TIMEOUT = 600     # ۱۰ دقیقه - بستن خودکار مرورگرهای باز
 MAX_RELATED_DEPTH = 3          # حداکثر عمق برای ویدیوهای مشابه (پیشنهادی)
@@ -48,7 +49,7 @@ USER_AGENT = (
 FFMPEG_PATH = "ffmpeg"   # فرض بر این است که ffmpeg در PATH سیستم موجود است
 
 # ──────────────── شناسه ادمین پیش‌فرض ────────────────
-DEFAULT_ADMIN_CHAT_ID = 46829437   # در صورت نبودن فایل admin.json، این شناسه استفاده می‌شود
+DEFAULT_ADMIN_CHAT_ID = 123456789   # در صورت نبودن فایل admin.json، این شناسه استفاده می‌شود
 
 # ──────────────── تعریف متدهای جستجو ────────────────
 SEARCH_METHODS = {
@@ -257,6 +258,10 @@ DEFAULT_SESSION_SETTINGS = {
     "download_chain": DEFAULT_DOWNLOAD_CHAIN[:],
     "result_page_size": 5,
     "show_thumbnails": True,
+    # timeoutهای عملیات (قابل تنظیم توسط کاربر)
+    "search_timeout": 90,    # ثانیه برای جستجوی اولیه
+    "watch_timeout": 60,     # ثانیه برای scrape_watch
+    "info_timeout": 60,      # ثانیه برای دریافت اطلاعات ویدیو
 }
 
 # ──────────────── تنظیمات پروکسی و PO Token ────────────────
