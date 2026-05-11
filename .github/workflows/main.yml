@@ -1,46 +1,45 @@
-name: YouTube Bale Bot V3
+name: YouTube Bale Bot (3h cycle)
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    # هر ۳ ساعت یک‌بار: 
+    # دقیقه ۰ در ساعت‌های ۰, ۳, ۶, ۹, ۱۲, ۱۵, ۱۸, ۲۱ (UTC)
+    - cron: '0 */3 * * *'
+
+  # اجازه اجرای دستی از تب Actions
   workflow_dispatch:
 
 jobs:
-  bot:
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+
+    # حداکثر زمان اجرای هر Job: ۳ ساعت (۱۸۰ دقیقه)
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install --upgrade pip
+          pip install requests scrapetube playwright
+          python -m playwright install --with-deps chromium
 
-      - name: Install Playwright browsers
-        run: playwright install --with-deps chromium
-
-      - name: Run the bot (5h 55m loop)
+      - name: Run bot (3 hours)
         env:
           BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          DEBUG: "0"
         run: |
-          start_time=$(date +%s)
-          max_duration_seconds=$((5 * 3600 + 55 * 60))
-          while true; do
-            current_time=$(date +%s)
-            elapsed=$((current_time - start_time))
-            if [ $elapsed -ge $max_duration_seconds ]; then
-              echo "⏰ زمان اجرا به ۵:۵۵ رسید. خروج آرام..."
-              break
-            fi
-            python main.py || true
-            sleep 2
-          done
+          python Bot.py
