@@ -3,6 +3,7 @@ main.py - حلقه اصلی ربات YouTube Bale Bot (نسخه ۳)
 رفع باگ‌های ارسال سند، تحویل نتایج جستجو، پاسخ کال‌بک تکراری و مدیریت upload
 اضافه شدن timeout برای عملیات‌ها، فرمان /channel، پایداری worker و محافظت در برابر هنگ
 به‌روزرسانی برای جستجوی دو مرحله‌ای: scrapetube + scrape_watch
+به‌روزرسانی timeoutها از تنظیمات پویا
 """
 
 import os
@@ -319,10 +320,26 @@ def process_job(job: Dict[str, Any]) -> None:
 
     try:
         if command == "search":
+            config = load_method_config()
+            search_timeout = config.get("search_timeout", 90)
             query = params.get("query", "")
             limit = params.get("limit", 10)
             # جستجوی سریع با scrapetube
-            results, method_used = youtube_core.search_youtube(query, limit=limit)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    youtube_core.search_youtube, query=query, limit=limit
+                )
+                try:
+                    results, method_used = future.result(timeout=search_timeout)
+                except concurrent.futures.TimeoutError:
+                    _log.warning(f"جستجو برای '{query}' بیش از {search_timeout}s طول کشید.")
+                    send_message(chat_id, "⏰ عملیات بیش از حد طول کشید. می‌توانید timeout را در تنظیمات افزایش دهید.")
+                    return
+                except Exception as e:
+                    _log.exception(f"خطا در جستجو: {e}")
+                    send_message(chat_id, f"⛔ خطا در جستجو: {str(e)[:200]}")
+                    return
+
             if not results:
                 send_message(chat_id, "🔎 نتیجه‌ای یافت نشد.")
                 return
@@ -349,14 +366,16 @@ def process_job(job: Dict[str, Any]) -> None:
                     })
 
         elif command == "scrape_watch":
+            config = load_method_config()
+            watch_timeout = config.get("watch_timeout", 60)
             video_id = params.get("video_id")
             index = params.get("index", "?")
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(youtube_core.scrape_watch_page, video_id)
                 try:
-                    info = future.result(timeout=20)
+                    info = future.result(timeout=watch_timeout)
                 except concurrent.futures.TimeoutError:
-                    send_message(chat_id, f"⚠️ اطلاعات ویدیوی {index} دریافت نشد. شناسه: {video_id}")
+                    send_message(chat_id, "⏰ عملیات بیش از حد طول کشید. می‌توانید timeout را در تنظیمات افزایش دهید.")
                     return
                 except Exception as e:
                     _log.exception(f"scrape_watch error for {video_id}: {e}")
@@ -391,15 +410,16 @@ def process_job(job: Dict[str, Any]) -> None:
             send_message(chat_id, msg)
 
         elif command == "info":
+            config = load_method_config()
+            info_timeout = config.get("info_timeout", 60)
             video_id = params.get("video_id")
-
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(youtube_core.get_video_info, video_id=video_id)
                 try:
-                    info_dict, method_used = future.result(timeout=settings.INFO_TIMEOUT)
+                    info_dict, method_used = future.result(timeout=info_timeout)
                 except concurrent.futures.TimeoutError:
-                    _log.warning(f"دریافت اطلاعات برای {video_id} بیش از {settings.INFO_TIMEOUT}s طول کشید.")
-                    send_message(chat_id, "⏰ دریافت اطلاعات زمان‌بر شد. لطفاً دوباره تلاش کنید.")
+                    _log.warning(f"دریافت اطلاعات برای {video_id} بیش از {info_timeout}s طول کشید.")
+                    send_message(chat_id, "⏰ عملیات بیش از حد طول کشید. می‌توانید timeout را در تنظیمات افزایش دهید.")
                     return
                 except Exception as e:
                     _log.exception(f"خطا در دریافت اطلاعات: {e}")
@@ -410,7 +430,6 @@ def process_job(job: Dict[str, Any]) -> None:
                 send_message(chat_id, "❌ اطلاعات ویدیو دریافت نشد.")
                 return
 
-            # دانلود تامنیل با timeout کوتاه
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as thumb_exec:
                     thumb_future = thumb_exec.submit(youtube_core.download_thumbnail, video_id, job_folder)
@@ -458,7 +477,6 @@ def process_job(job: Dict[str, Any]) -> None:
                 parts = split_file_binary(zip_path, os.path.splitext(os.path.basename(zip_path))[0], ".zip")
                 os.remove(zip_path)
 
-            # ارسال با upload_manager با timeout
             state_file = os.path.join(settings.DATA_DIR, f"upload_state_{job_id}.json")
             upload_timeout = settings.REQUEST_TIMEOUT * len(parts)
             try:
@@ -467,7 +485,7 @@ def process_job(job: Dict[str, Any]) -> None:
                     success = up_future.result(timeout=upload_timeout)
             except concurrent.futures.TimeoutError:
                 _log.warning("ارسال ویدیو بیش از حد طول کشید - لغو شد.")
-                send_message(chat_id, "⏰ ارسال ویدیو زمان‌بر شد. لطفاً بعداً بررسی کنید.")
+                send_message(chat_id, "⏰ عملیات بیش از حد طول کشید. می‌توانید timeout را در تنظیمات افزایش دهید.")
                 success = False
             except Exception as e:
                 _log.exception(f"خطا در ارسال ویدیو: {e}")
@@ -478,7 +496,6 @@ def process_job(job: Dict[str, Any]) -> None:
             else:
                 send_message(chat_id, "⚠️ خطایی در ارسال ویدیو رخ داد. لطفاً دوباره تلاش کنید.")
 
-            # پاکسازی قطعات و فایل اصلی
             for p in parts:
                 try:
                     os.remove(p)
@@ -494,6 +511,8 @@ def process_job(job: Dict[str, Any]) -> None:
             channel_id = params.get("channel_id")
             sort_by = params.get("sort_by", "newest")
             limit = params.get("limit", settings.CHANNEL_VIDEOS_LIMIT)
+            config = load_method_config()
+            search_timeout = config.get("search_timeout", 90)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(
@@ -501,9 +520,9 @@ def process_job(job: Dict[str, Any]) -> None:
                     channel_id=channel_id, sort_by=sort_by, max_results=limit
                 )
                 try:
-                    videos = future.result(timeout=settings.SEARCH_TIMEOUT)
+                    videos = future.result(timeout=search_timeout)
                 except concurrent.futures.TimeoutError:
-                    send_message(chat_id, "⏰ دریافت ویدیوهای کانال زمان‌بر شد. لطفاً دوباره تلاش کنید.")
+                    send_message(chat_id, "⏰ عملیات بیش از حد طول کشید. می‌توانید timeout را در تنظیمات افزایش دهید.")
                     return
                 except Exception as e:
                     _log.exception(f"خطا در channel: {e}")
@@ -603,13 +622,20 @@ def worker_loop() -> None:
         command = job.get('command', '?')
         chat_id = job.get('chat_id')
 
-        # انتخاب timeout بر اساس نوع دستور
+        # انتخاب timeout بر اساس نوع دستور و تنظیمات کاربر
+        config = load_method_config()
         if command == "scrape_watch":
-            outer_timeout = 20
+            outer_timeout = config.get("watch_timeout", 60) + 10
+        elif command == "search":
+            outer_timeout = config.get("search_timeout", 90) + 15
+        elif command == "info":
+            outer_timeout = config.get("info_timeout", 60) + 10
         elif command == "download":
-            outer_timeout = 60
+            outer_timeout = 120
+        elif command == "channel":
+            outer_timeout = config.get("search_timeout", 90) + 15
         else:
-            outer_timeout = settings.SEARCH_TIMEOUT + 10   # ۳۵ ثانیه پیش‌فرض
+            outer_timeout = 35
 
         _log.info(f"شروع پردازش {job_id} ({command}) با timeout {outer_timeout}s")
         err = run_job_with_timeout(job, outer_timeout)
@@ -619,7 +645,7 @@ def worker_loop() -> None:
         elif isinstance(err, TimeoutError):
             try:
                 if chat_id:
-                    send_message(chat_id, f"⏰ درخواست {command} بیش از حد طول کشید و لغو شد.")
+                    send_message(chat_id, "⏰ عملیات بیش از حد طول کشید. می‌توانید timeout را در تنظیمات افزایش دهید.")
             except:
                 pass
         else:
