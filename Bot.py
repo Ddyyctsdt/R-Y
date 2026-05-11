@@ -1,7 +1,8 @@
 """
-bot.py - YouTube Bale Bot v4
-Single-file robust bot with quota, Playwright scraping, and reliable upload.
+bot.py - YouTube Bale Bot v4.2
+Single-file robust bot with quota, Playwright scraping, reliable upload, and link download.
 """
+
 import os, re, sys, time, json, math, uuid, shutil, threading, subprocess, traceback, logging
 from typing import Any, Dict, List, Optional, Tuple
 import requests, scrapetube
@@ -119,6 +120,7 @@ def split_file_binary(file_path: str, prefix: str, ext: str) -> List[str]:
     return part_paths
 
 def split_video_by_size(video_path: str, max_size_bytes: int = MAX_SEND_SIZE) -> List[str]:
+    """Split video into playable chunks ≤ max_size_bytes using ffmpeg segment or fallback with size check."""
     if not os.path.exists(video_path):
         return []
     total_size = os.path.getsize(video_path)
@@ -126,42 +128,85 @@ def split_video_by_size(video_path: str, max_size_bytes: int = MAX_SEND_SIZE) ->
         dest = os.path.join(os.path.dirname(video_path), os.path.basename(video_path))
         shutil.copy2(video_path, dest)
         return [dest]
-    ffprobe = shutil.which("ffprobe")
+
     ffmpeg = shutil.which("ffmpeg")
-    if not ffprobe or not ffmpeg:
-        logger.error("ffprobe/ffmpeg not found")
+    if not ffmpeg:
+        logger.error("ffmpeg not found")
         return []
+
+    out_dir = os.path.dirname(video_path)
+    # Method 1: segment_size (newer ffmpeg)
     try:
-        dur_output = subprocess.run(
+        cmd = [
+            ffmpeg, "-y", "-i", video_path,
+            "-c", "copy", "-map", "0",
+            "-f", "segment", "-segment_size", str(max_size_bytes),
+            "-reset_timestamps", "1",
+            os.path.join(out_dir, "chunk_%03d.mp4")
+        ]
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        parts = sorted([
+            os.path.join(out_dir, f) for f in os.listdir(out_dir)
+            if re.match(r"chunk_\d{3}\.mp4$", f)
+        ])
+        if parts and all(os.path.getsize(p) <= max_size_bytes for p in parts):
+            return parts
+    except subprocess.CalledProcessError:
+        logger.info("segment_size failed, falling back to manual method")
+
+    # Method 2: manual segmentation with guaranteed size limit
+    try:
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return []
+        dur_result = subprocess.run(
             [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
             capture_output=True, text=True, check=True
         )
-        total_dur = float(dur_output.stdout.strip())
-        if total_dur <= 0:
-            raise ValueError("Invalid duration")
+        duration = float(dur_result.stdout.strip())
+        if duration <= 0:
+            return []
+        avg_bitrate = (total_size * 8) / duration
+        # initial chunk_time with safety factor 0.9
+        chunk_time = (max_size_bytes * 8 * 0.9) / avg_bitrate
+        if chunk_time <= 0:
+            return []
+
+        parts = []
+        start = 0.0
+        chunk_idx = 1
+        while start < duration:
+            end = min(start + chunk_time, duration)
+            out_path = os.path.join(out_dir, f"chunk_{chunk_idx:03d}.mp4")
+            # try to create chunk under size limit, adjusting duration if needed
+            for retry in range(5):
+                cmd = [
+                    ffmpeg, "-y", "-ss", str(start), "-to", str(end),
+                    "-i", video_path, "-c", "copy",
+                    "-movflags", "+faststart",
+                    out_path
+                ]
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                chunk_size = os.path.getsize(out_path)
+                if chunk_size <= max_size_bytes:
+                    parts.append(out_path)
+                    break
+                # chunk too large, reduce end point
+                safe_remove(out_path)
+                end = start + (end - start) * 0.9
+                if end - start < 1.0:  # minimum 1 second
+                    logger.error("Cannot create chunk <= max_size_bytes")
+                    return []   # abandon
+            else:
+                # all retries failed
+                logger.error("Chunk creation failed after 5 retries")
+                return []
+            start = end
+            chunk_idx += 1
+        return parts
     except Exception as e:
-        logger.error(f"ffprobe failed: {e}")
+        logger.error(f"Manual split failed: {e}")
         return []
-    chunks = math.ceil(total_size / max_size_bytes)
-    chunk_dur = total_dur / chunks
-    out_pattern = os.path.join(os.path.dirname(video_path), "chunk_%03d.mp4")
-    cmd = [
-        ffmpeg, "-y", "-i", video_path,
-        "-c", "copy", "-map", "0",
-        "-f", "segment", "-segment_time", str(chunk_dur),
-        "-reset_timestamps", "1", out_pattern
-    ]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"ffmpeg split error: {e.stderr}")
-        return []
-    parts = sorted([
-        os.path.join(os.path.dirname(video_path), f)
-        for f in os.listdir(os.path.dirname(video_path))
-        if re.match(r"chunk_\d{3}\.mp4$", f)
-    ])
-    return parts
 
 def download_thumbnail(video_id: str, save_dir: str) -> Optional[str]:
     base = "https://img.youtube.com/vi/{}/{}"
@@ -240,6 +285,14 @@ def load_users() -> Dict:
         data = load_json(USERS_FILE, {"admin_id": ADMIN_CHAT_ID, "users": {}})
         data.setdefault("admin_id", ADMIN_CHAT_ID)
         data.setdefault("users", {})
+        adm_uid = str(data["admin_id"])
+        if adm_uid not in data["users"]:
+            data["users"][adm_uid] = {
+                "quota_used_bytes": 0,
+                "quota_reset_time": 0.0,
+                "quality": "720p",
+                "send_mode": "playable"
+            }
         for u in data["users"].values():
             u.setdefault("quota_used_bytes", 0)
             u.setdefault("quota_reset_time", 0.0)
@@ -255,7 +308,6 @@ def is_admin(chat_id: int) -> bool:
     return chat_id == load_users().get("admin_id")
 
 def check_quota_before(chat_id: int, threshold_bytes: int) -> Tuple[bool, str]:
-    """Check if user has at least threshold_bytes remaining quota."""
     if is_admin(chat_id):
         return True, ""
     data = load_users()
@@ -274,7 +326,6 @@ def check_quota_before(chat_id: int, threshold_bytes: int) -> Tuple[bool, str]:
     return True, ""
 
 def add_quota_usage(chat_id: int, bytes_used: int) -> None:
-    """Add actual downloaded bytes to user quota (resets if needed)."""
     if is_admin(chat_id):
         return
     data = load_users()
@@ -291,6 +342,8 @@ def add_quota_usage(chat_id: int, bytes_used: int) -> None:
 
 def add_user(target_id: int) -> Tuple[bool, str]:
     data = load_users()
+    if target_id == data["admin_id"]:
+        return False, "⚠️ ادمین نیازی به افزودن ندارد."
     uid = str(target_id)
     if uid in data["users"]:
         return False, "⚠️ کاربر قبلاً اضافه شده است."
@@ -331,7 +384,7 @@ def search_youtube(query: str, limit: int = 10) -> List[str]:
         logger.error(f"scrapetube error: {e}")
         return []
 
-# ---------- Scrape ----------
+# ---------- Playwright scraping ----------
 def scrape_watch_page(video_id: str) -> Optional[Dict[str, Any]]:
     pw = browser = context = page = None
     try:
@@ -341,7 +394,6 @@ def scrape_watch_page(video_id: str) -> Optional[Dict[str, Any]]:
         page = context.new_page()
         page.goto(f"https://www.youtube.com/watch?v={video_id}",
                   wait_until="domcontentloaded", timeout=WATCH_TIMEOUT * 1000)
-        # Wait for the main element instead of hardcoded sleep
         page.wait_for_selector("h1 yt-formatted-string", timeout=15000)
 
         try:
@@ -354,21 +406,65 @@ def scrape_watch_page(video_id: str) -> Optional[Dict[str, Any]]:
 
         data = page.evaluate("""
         () => {
-            const title = document.querySelector('h1 yt-formatted-string')?.textContent.trim() || '';
-            const uploader = document.querySelector('#owner yt-formatted-string a, ytd-channel-name a')?.textContent.trim() || '';
-            const views = document.querySelector('#info .view-count, #count .view-count')?.textContent.trim() || '';
-            const likes = document.querySelector('#top-level-buttons-computed ytd-toggle-button-renderer:first-child #text, #segmented-like-button yt-button-shape button div[aria-label]')?.textContent.trim() || '';
-            const duration = (() => {
-                try {
-                    const attr = document.querySelector('ytd-watch-flexy')?.getAttribute('ytd-watch-flexy');
-                    if (attr) return JSON.parse(attr)?.args?.raw_player_response?.videoDetails?.lengthSeconds || '';
-                } catch(e) {}
-                return '';
-            })();
-            const desc = document.querySelector('#description-inline-expander yt-formatted-string, #description yt-formatted-string')?.textContent.trim() || '';
-            return { title, uploader, views, likes, duration, description: desc };
+            let title = '', uploader = '', views = '', likes = '', duration = '', description = '';
+            const player = window.ytInitialPlayerResponse;
+            if (player && player.videoDetails) {
+                title = player.videoDetails.title || '';
+                uploader = player.videoDetails.author || '';
+                duration = player.videoDetails.lengthSeconds || '';
+            }
+            const ytData = window.ytInitialData;
+            if (ytData) {
+                const contents = ytData.contents?.twoColumnWatchNextResults?.results?.results?.contents;
+                const primaryInfo = contents?.find(c => c.videoPrimaryInfoRenderer)?.videoPrimaryInfoRenderer;
+                const secondaryInfo = contents?.find(c => c.videoSecondaryInfoRenderer)?.videoSecondaryInfoRenderer;
+                if (primaryInfo) {
+                    const viewCount = primaryInfo.viewCount?.videoViewCountRenderer?.viewCount?.simpleText;
+                    if (viewCount) views = viewCount;
+                    const likeButton = primaryInfo.videoActions?.menuRenderer?.topLevelButtons?.[0]?.toggleButtonRenderer;
+                    const likeText = likeButton?.defaultText?.simpleText || likeButton?.toggledText?.simpleText;
+                    if (likeText) likes = likeText;
+                }
+                if (!uploader && secondaryInfo) {
+                    const owner = secondaryInfo.owner?.videoOwnerRenderer?.title?.runs?.[0]?.text;
+                    if (owner) uploader = owner;
+                }
+            }
+            if (!title) {
+                const el = document.querySelector('h1 yt-formatted-string');
+                title = el ? el.textContent.trim() : '';
+            }
+            if (!uploader) {
+                const el = document.querySelector('#owner yt-formatted-string a, ytd-channel-name a');
+                uploader = el ? el.textContent.trim() : '';
+            }
+            if (!views) {
+                const el = document.querySelector('#info .view-count, #count .view-count');
+                views = el ? el.textContent.trim() : '';
+            }
+            if (!likes) {
+                const el = document.querySelector('#top-level-buttons-computed ytd-toggle-button-renderer:first-child #text, #segmented-like-button yt-button-shape button div[aria-label]');
+                likes = el ? el.textContent.trim() : '';
+            }
+            if (!duration) {
+                const meta = document.querySelector('meta[itemprop="duration"]');
+                if (meta) {
+                    const iso = meta.getAttribute('content');
+                    const match = iso.match(/PT(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+)S)?/);
+                    if (match) {
+                        const h = parseInt(match[1]||0), m = parseInt(match[2]||0), s = parseInt(match[3]||0);
+                        duration = (h*3600 + m*60 + s).toString();
+                    }
+                }
+            }
+            const descEl = document.querySelector('#description-inline-expander yt-formatted-string, #description yt-formatted-string');
+            description = descEl ? descEl.textContent.trim() : '';
+            return { title, uploader, views, likes, duration, description };
         }
         """)
+        dur = data.get("duration")
+        if dur and isinstance(dur, str) and dur.isdigit():
+            data["duration"] = int(dur)
         return {
             "video_id": video_id,
             "title": data.get("title"),
@@ -388,16 +484,15 @@ def scrape_watch_page(video_id: str) -> Optional[Dict[str, Any]]:
         if pw: pw.stop()
 
 def format_count(raw: str) -> str:
-    """Convert '1,234,567 views' to '1.2M views' etc."""
     if not raw:
         return "?"
     num_str = re.sub(r"[^\d]", "", raw)
     if not num_str:
-        return raw
+        return raw.strip() or "?"
     try:
         num = int(num_str)
     except ValueError:
-        return raw
+        return raw.strip() or "?"
     if num >= 1_000_000:
         formatted = f"{num/1_000_000:.1f}M"
         if formatted.endswith(".0M"):
@@ -408,8 +503,19 @@ def format_count(raw: str) -> str:
             formatted = formatted[:-2] + "K"
     else:
         formatted = str(num)
-    suffix = raw.replace(num_str, "", 1).strip()
-    return f"{formatted} {suffix}".strip()
+    return formatted
+
+def seconds_to_display(sec: int) -> str:
+    if not isinstance(sec, (int, float)):
+        return str(sec)
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec} ثانیه"
+    mins = sec // 60
+    secs = sec % 60
+    if secs == 0:
+        return f"{mins} دقیقه"
+    return f"{mins} دقیقه {secs} ثانیه"
 
 # ---------- Info Handler ----------
 def handle_info(chat_id: int, video_id: str, index: int) -> None:
@@ -428,10 +534,11 @@ def handle_info(chat_id: int, video_id: str, index: int) -> None:
     uploader = info.get("uploader", "?")
     views = format_count(info.get("views", "?"))
     likes = format_count(info.get("likes", "?"))
-    duration = info.get("duration", "?")
+    duration_raw = info.get("duration", "?")
+    duration_display = seconds_to_display(duration_raw) if isinstance(duration_raw, (int, float)) else str(duration_raw)
     desc = info.get("description", "")
 
-    msg = f"📹 {title}\n👤 {uploader}\n👁 {views} | ❤️ {likes} | ⏱ {duration} ثانیه\n"
+    msg = f"📹 {title}\n👤 {uploader}\n👁 {views} | ❤️ {likes} | ⏱ {duration_display}\n"
     if desc and len(desc) <= 200:
         msg += f"📝 {desc}\n"
     elif desc:
@@ -447,7 +554,6 @@ def handle_info(chat_id: int, video_id: str, index: int) -> None:
 
 # ---------- Download & Upload ----------
 def _download_hubytconvert(video_id: str, quality: str, save_dir: str) -> Optional[str]:
-    """Download via hub.ytconvert.org."""
     try:
         s = requests.Session()
         s.get("https://media.ytmp3.gg/", headers={"User-Agent": USER_AGENT}, timeout=10)
@@ -488,7 +594,6 @@ def _download_hubytconvert(video_id: str, quality: str, save_dir: str) -> Option
     return None
 
 def _download_cobalt(video_id: str, quality: str, save_dir: str) -> Optional[str]:
-    """Download via cobalt.tools."""
     try:
         r = requests.post(
             "https://api.cobalt.tools/api/json",
@@ -504,37 +609,60 @@ def _download_cobalt(video_id: str, quality: str, save_dir: str) -> Optional[str
     return None
 
 def download_video(video_id: str, quality: str, save_dir: str) -> Optional[str]:
-    """Try hubytconvert then cobalt."""
     path = _download_hubytconvert(video_id, quality, save_dir)
     if path:
         return path
     return _download_cobalt(video_id, quality, save_dir)
 
 def send_video_parts(parts: List[str], chat_id: int) -> bool:
+    """Upload parts with 15s delay, 10s retry, 900s total timeout, and dynamic oversize handling."""
     total = len(parts)
-    for i, part in enumerate(parts, 1):
-        send_message(chat_id, f"📤 در حال ارسال پارت {i}/{total}...")
+    start_time = time.time()
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+
+        # Global timeout
+        if time.time() - start_time > 900:
+            send_message(chat_id, "⏰ زمان ارسال به پایان رسید.")
+            return False
+
+        # If part too large, split further
+        if os.path.getsize(part) > MAX_SEND_SIZE:
+            logger.info(f"Part {i+1} oversized, binary splitting")
+            base, ext = os.path.splitext(part)
+            sub_parts = split_file_binary(part, base, ext)
+            safe_remove(part)
+            # Replace this part with the sub-parts in place
+            parts.pop(i)
+            for j, sp in enumerate(sub_parts):
+                parts.insert(i + j, sp)
+            total = len(parts)
+            continue   # stay at same i to process the first new sub-part
+
+        # Send the part
+        send_message(chat_id, f"📤 در حال ارسال پارت {i+1}/{total}...")
         success = False
         for attempt in range(1, 4):
             try:
-                res = send_document(chat_id, part, caption=f"بخش {i}/{total}")
+                res = send_document(chat_id, part, caption=f"بخش {i+1}/{total}")
                 if res and res.get("ok"):
                     success = True
                     break
             except Exception:
                 pass
             if attempt < 3:
-                send_message(chat_id, f"🔄 تلاش {attempt+1} برای پارت {i}...")
+                send_message(chat_id, f"🔄 تلاش {attempt+1} برای پارت {i+1} در ۱۰ ثانیه...")
+                time.sleep(10)
             else:
-                send_message(chat_id, f"⛔ ارسال پارت {i} ناموفق ماند. لطفاً دوباره تلاش کنید.")
+                send_message(chat_id, f"⛔ ارسال پارت {i+1} ناموفق ماند. لطفاً دوباره تلاش کنید.")
         if not success:
             return False
-        if i < total:
-            time.sleep(1)
+        time.sleep(15)
+        i += 1   # move to next part only after successful send
     return True
 
 def handle_download(chat_id: int, video_id: str, index: int) -> None:
-    # Pre-flight quota check with threshold
     allowed, msg = check_quota_before(chat_id, QUOTA_THRESHOLD)
     if not allowed:
         send_message(chat_id, msg)
@@ -556,9 +684,8 @@ def handle_download(chat_id: int, video_id: str, index: int) -> None:
             return
 
         file_size = os.path.getsize(video_path)
-        add_quota_usage(chat_id, file_size)   # counts even if upload fails
+        add_quota_usage(chat_id, file_size)
 
-        # Split according to mode
         if send_mode == "playable":
             parts = split_video_by_size(video_path, MAX_SEND_SIZE)
         else:
@@ -580,13 +707,13 @@ def handle_download(chat_id: int, video_id: str, index: int) -> None:
         logger.exception("download flow error")
         send_message(chat_id, f"⛔ خطایی رخ داد: {str(e)[:200]}")
     finally:
-        # Full cleanup
         shutil.rmtree(save_dir, ignore_errors=True)
 
 # ---------- Menus ----------
 def main_menu() -> Dict:
     return {"inline_keyboard": [
-        [{"text": "🔍 جستجو", "callback_data": "search"}],
+        [{"text": "🔍 جستجو", "callback_data": "search"},
+         {"text": "📥 دانلود با لینک", "callback_data": "download_link"}],
         [{"text": "ℹ️ راهنما", "callback_data": "help"},
          {"text": "⚙️ تنظیمات", "callback_data": "settings"}]
     ]}
@@ -636,21 +763,28 @@ def handle_search_command(chat_id: int, query: str) -> None:
             safe_remove(thumb)
         send_message(chat_id, f"🔗 https://youtube.com/watch?v={vid}\n📥 /dl_{idx}\nℹ️ /info_{idx}")
 
+def handle_link_download(chat_id: int, text: str) -> None:
+    video_id = extract_video_id(text)
+    if not video_id:
+        send_message(chat_id, "❌ لینک یوتیوب نامعتبر است.")
+        return
+    threading.Thread(target=handle_download, args=(chat_id, video_id, 0), daemon=True).start()
+
 def process_message(chat_id: int, text: str) -> None:
-    # Access check
     if not is_admin(chat_id) and str(chat_id) not in load_users().get("users", {}):
         send_message(chat_id, "⛔ دسترسی ندارید.")
         return
 
-    # State handling
     with state_lock:
-        state = USER_STATE.pop(chat_id, None)   # consume state
+        state = USER_STATE.pop(chat_id, None)
 
     if state == "awaiting_query" and not text.startswith("/"):
         handle_search_command(chat_id, text)
         return
+    if state == "awaiting_url" and not text.startswith("/"):
+        handle_link_download(chat_id, text)
+        return
 
-    # Command routing
     if text == "/start":
         send_message(chat_id, "🤖 به ربات YouTube Bale خوش آمدید!", reply_markup=main_menu())
     elif text == "/search":
@@ -685,14 +819,16 @@ def process_message(chat_id: int, text: str) -> None:
         s = get_user_settings(chat_id)
         send_message(chat_id, "⚙️ تنظیمات:", reply_markup=settings_menu(s["quality"], s["send_mode"]))
     elif text == "/help":
-        send_message(chat_id, (
+        help_text = (
             "📖 راهنمای ربات:\n"
             "/search - جستجوی ویدیو\n"
             "/info_1 - اطلاعات ویدیوی شماره ۱\n"
             "/dl_1 - دانلود ویدیوی شماره ۱\n"
             "/settings - تنظیمات\n"
+            "📥 با دکمه «دانلود با لینک» لینک مستقیم بفرستید.\n"
             "📌 ادمین: /add_user شناسه"
-        ))
+        )
+        send_message(chat_id, help_text)
     elif text.startswith("/add_user") and is_admin(chat_id):
         parts = text.split()
         if len(parts) == 2:
@@ -720,11 +856,15 @@ def process_message(chat_id: int, text: str) -> None:
 
 # ---------- Callback Handler ----------
 def process_callback(chat_id: int, data: str, message_id: int, callback_query_id: str) -> None:
-    answer_callback_query(callback_query_id)  # only once
+    toast_text = ""
     if data == "search":
         with state_lock:
             USER_STATE[chat_id] = "awaiting_query"
         edit_message_text(chat_id, message_id, "🔍 عبارت جستجو را تایپ کنید:")
+    elif data == "download_link":
+        with state_lock:
+            USER_STATE[chat_id] = "awaiting_url"
+        edit_message_text(chat_id, message_id, "📥 لینک ویدیوی یوتیوب را بفرستید:")
     elif data == "help":
         edit_message_text(chat_id, message_id, "📖 راهنما: /help")
         process_message(chat_id, "/help")
@@ -739,10 +879,10 @@ def process_callback(chat_id: int, data: str, message_id: int, callback_query_id
     elif data.startswith("quality_"):
         q = data.split("_", 1)[1]
         update_user_setting(chat_id, "quality", q)
-        # Show confirmation and return to settings
         edit_message_text(chat_id, message_id, f"✅ کیفیت روی {q} تنظیم شد.")
         s = get_user_settings(chat_id)
         send_message(chat_id, "⚙️ تنظیمات:", reply_markup=settings_menu(s["quality"], s["send_mode"]))
+        toast_text = f"کیفیت روی {q} تنظیم شد."
     elif data == "set_mode":
         s = get_user_settings(chat_id)
         edit_message_text(chat_id, message_id, "📦 حالت ارسال:",
@@ -754,14 +894,15 @@ def process_callback(chat_id: int, data: str, message_id: int, callback_query_id
         edit_message_text(chat_id, message_id, f"✅ حالت ارسال: {mode_str}")
         s = get_user_settings(chat_id)
         send_message(chat_id, "⚙️ تنظیمات:", reply_markup=settings_menu(s["quality"], s["send_mode"]))
+        toast_text = f"حالت ارسال: {mode_str}"
     elif data == "main_menu":
         edit_message_text(chat_id, message_id, "🏠 منوی اصلی:", reply_markup=main_menu())
-    else:
-        pass
+    # Always send one callback answer with the collected toast text
+    answer_callback_query(callback_query_id, toast_text)
 
 # ---------- Main ----------
 def main():
-    logger.info("YouTube Bale Bot v4 started")
+    logger.info("YouTube Bale Bot v4.2 started")
     os.makedirs("downloads", exist_ok=True)
     offset = 0
     while True:
