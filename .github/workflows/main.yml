@@ -2,18 +2,12 @@ name: YouTube Bale Bot (3h cycle)
 
 on:
   schedule:
-    # هر ۳ ساعت یک‌بار: 
-    # دقیقه ۰ در ساعت‌های ۰, ۳, ۶, ۹, ۱۲, ۱۵, ۱۸, ۲۱ (UTC)
     - cron: '0 */3 * * *'
-
-  # اجازه اجرای دستی از تب Actions
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-
-    # حداکثر زمان اجرای هر Job: ۳ ساعت (۱۸۰ دقیقه)
     timeout-minutes: 180
 
     steps:
