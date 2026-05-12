@@ -5,7 +5,7 @@ keyframe-aware video splitting replaced by 3-layer split, cookie expiry detectio
 VIP priority fix.
 """
 
-import os, re, sys, time, json, math, uuid, shutil, threading, subprocess, traceback, logging
+import os, re, sys, time, json, math, uuid, shutil, zipfile, threading, subprocess, traceback, logging
 from typing import Any, Dict, List, Optional, Tuple
 import requests, scrapetube
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
@@ -1121,11 +1121,30 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
         else:
             zip_base = os.path.splitext(video_path)[0]
             zip_path = f"{zip_base}.zip"
-            shutil.make_archive(zip_base, 'zip', os.path.dirname(video_path), os.path.basename(video_path))
-            if not os.path.exists(zip_path) or os.path.getsize(zip_path) == 0:
+            try:
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    zf.write(video_path, os.path.basename(video_path))
+            except Exception as e:
+                logger.error(f"Zip creation failed: {e}")
                 send_message(report_chat_id, "❌ خطا در فشرده‌سازی فایل.")
                 safe_remove(video_path)
                 return
+            
+            # Flush guarantee
+            time.sleep(1)
+            
+            # Integrity check
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    if zf.testzip() is not None:
+                        raise ValueError("Corrupt zip file")
+            except Exception as e:
+                logger.error(f"Zip integrity check failed: {e}")
+                send_message(report_chat_id, "❌ خطا در فشرده‌سازی فایل. لطفاً دوباره تلاش کنید.")
+                safe_remove(zip_path)
+                safe_remove(video_path)
+                return
+            
             parts = split_file_binary(zip_path, original_filename=os.path.basename(zip_path))
             safe_remove(zip_path)
 
