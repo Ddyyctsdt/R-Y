@@ -1,6 +1,8 @@
 """
 bot.py - YouTube Bale Bot v5.0
-Advanced multi-method search, info, download, channel support, pagination, cookies, and full configurability.
+Advanced multi-method search, info, download, channel support, pagination, cookies,
+keyframe-aware video splitting, quality profiles, VIP auto-registration, admin panel,
+and silent channel handling.
 """
 
 import os, re, sys, time, json, math, uuid, shutil, threading, subprocess, traceback, logging
@@ -37,6 +39,14 @@ VIP_HOURS = 6
 
 BITRATE_TABLE = {
     "360p": 0.5e6, "480p": 1e6, "720p": 2e6, "1080p": 4e6, "4K": 12e6
+}
+
+QUALITY_PROFILES = {
+    "360p": {"height": 360, "vcodec": "h264", "max_bitrate": "800k"},
+    "480p": {"height": 480, "vcodec": "h264", "max_bitrate": "1.2M"},
+    "720p": {"height": 720, "vcodec": "h264", "max_bitrate": "2.5M"},
+    "1080p": {"height": 1080, "vcodec": "h264", "max_bitrate": "5M"},
+    "4K": {"height": 2160, "vcodec": "vp9", "max_bitrate": "12M"},
 }
 
 # ---------- Logging ----------
@@ -87,7 +97,6 @@ def extract_video_id(url: str) -> Optional[str]:
 
 def download_file(url: str, save_dir: str, filename: Optional[str] = None, timeout: int = 120) -> Optional[str]:
     try:
-        # Fix protocol-relative URLs
         if url.startswith("//"):
             url = "https:" + url
         os.makedirs(save_dir, exist_ok=True)
@@ -111,7 +120,7 @@ def download_file(url: str, save_dir: str, filename: Optional[str] = None, timeo
         return None
 
 def split_file_binary(file_path: str, original_filename: Optional[str] = None) -> List[str]:
-    """Only used for zip parts or last-resort video split."""
+    """Binary split for zip mode – produces non-playable parts."""
     out_dir = os.path.dirname(file_path) or "."
     if original_filename is None:
         original_filename = os.path.basename(file_path)
@@ -130,97 +139,128 @@ def split_file_binary(file_path: str, original_filename: Optional[str] = None) -
             part_num += 1
     return part_paths
 
-def split_video_by_size(video_path: str, max_size_bytes: int = MAX_SEND_SIZE) -> List[str]:
-    """Split video into chunks ≤ max_size_bytes.
-    Tries in order: MP4Box, ffmpeg re-encode, binary split."""
-    if not os.path.exists(video_path):
-        return []
-    total_size = os.path.getsize(video_path)
-    if total_size <= max_size_bytes:
-        dest = os.path.join(os.path.dirname(video_path), os.path.basename(video_path))
-        shutil.copy2(video_path, dest)
-        return [dest]
+def split_video_by_keyframes(video_path: str, chat_id: int = 0) -> List[str]:
+    """
+    Keyframe-aware split: produces chunks ≤ 18 MB (with safety margin).
+    Reports progress to user if chat_id provided.
+    Falls back to sending whole file if keyframe extraction fails.
+    """
+    TARGET_SIZE = 17 * 1024 * 1024  # 17 MB target, ~18 MB actual
+    ffprobe = shutil.which("ffprobe")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffprobe or not ffmpeg:
+        if chat_id:
+            send_message(chat_id, "⚠️ امکان تقسیم خودکار ویدیو وجود نداشت. فایل کامل ارسال می‌شود.")
+        return [video_path]
 
+    # Extract keyframe packets: only lines with ",K" flag
+    try:
+        cmd = [
+            ffprobe, "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "packet=pts_time,size,flags",
+            "-of", "csv=p=0", video_path
+        ]
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    except Exception as e:
+        logger.error(f"ffprobe keyframe extraction failed: {e}")
+        if chat_id:
+            send_message(chat_id, "⚠️ امکان تقسیم خودکار ویدیو وجود نداشت. فایل کامل ارسال می‌شود.")
+        return [video_path]
+
+    keyframes = []  # list of (pts_time, size) only keyframes
+    for line in out.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split(",")
+        if len(parts) >= 3 and parts[2].strip() == "K":
+            try:
+                pts_time = float(parts[0])
+                size = int(parts[1])
+                keyframes.append((pts_time, size))
+            except ValueError:
+                continue
+
+    if not keyframes:
+        if chat_id:
+            send_message(chat_id, "⚠️ امکان تقسیم خودکار ویدیو وجود نداشت. فایل کامل ارسال می‌شود.")
+        return [video_path]
+
+    # Compute cumulative sizes up to each keyframe
+    cum_sizes = []
+    total = 0
+    for pts, sz in keyframes:
+        total += sz
+        cum_sizes.append((pts, total))
+
+    # Group keyframes into chunks ≤ TARGET_SIZE
+    cut_points = []
+    current_start = 0.0
+    current_size = 0
+    prev_pts = 0.0
+    for i, (pts, cum_size) in enumerate(cum_sizes):
+        chunk_size = cum_size - current_size
+        if chunk_size > TARGET_SIZE and i > 0:
+            # Cut at previous keyframe (the one before current)
+            cut_pts = prev_pts
+            cut_points.append(cut_pts)
+            current_size = cum_sizes[i-1][1]  # cumulative size at previous keyframe
+            current_start = cut_pts
+        prev_pts = pts
+    # Add last segment (from last cut to end)
+    if cut_points:
+        last_cut = cut_points[-1]
+        if last_cut < keyframes[-1][0]:
+            # we have a final segment
+            pass
+    else:
+        # No cuts made, file fits in one chunk (already handled earlier if total size <= TARGET_SIZE)
+        # but we still split to be safe
+        pass
+
+    # If no cuts needed, return whole file
+    if not cut_points:
+        return [video_path]
+
+    # Add end point
+    cut_points.append(keyframes[-1][0] + 0.5)  # a little beyond
+
+    # Build chunk ranges
+    chunks = []
+    prev_cut = 0.0
+    for cp in cut_points:
+        if cp > prev_cut:
+            chunks.append((prev_cut, cp))
+            prev_cut = cp
+
+    total_chunks = len(chunks)
+    parts = []
     out_dir = os.path.dirname(video_path)
 
-    # Layer 1: MP4Box
-    mp4box = shutil.which("MP4Box")
-    if mp4box:
+    for idx, (start, end) in enumerate(chunks, 1):
+        if chat_id:
+            send_message(chat_id, f"✂️ در حال برش قطعه {idx} از {total_chunks}...")
+        out_path = os.path.join(out_dir, f"chunk_{idx:03d}.mp4")
+        cmd = [
+            ffmpeg, "-y", "-ss", str(start), "-to", str(end),
+            "-i", video_path, "-c", "copy", "-movflags", "+faststart",
+            out_path
+        ]
         try:
-            max_size_kb = max_size_bytes // 1024
-            cmd = [mp4box, "-splits", str(max_size_kb), video_path]
-            subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=out_dir)
-            # MP4Box produces files like video_basename_001.mp4
-            basename_no_ext = os.path.splitext(os.path.basename(video_path))[0]
-            pattern = re.compile(rf"{re.escape(basename_no_ext)}_\d{{3}}\.mp4$")
-            parts = sorted([
-                os.path.join(out_dir, f) for f in os.listdir(out_dir) if pattern.match(f)
-            ])
-            if parts and all(os.path.getsize(p) <= max_size_bytes for p in parts):
-                return parts
-            logger.info("MP4Box produced files but some too large, falling back")
-        except Exception as e:
-            logger.warning(f"MP4Box split failed: {e}")
-
-    # Layer 2: ffmpeg with re-encode to guarantee size limit
-    ffmpeg = shutil.which("ffmpeg")
-    ffprobe = shutil.which("ffprobe")
-    if ffmpeg and ffprobe:
-        try:
-            dur_out = subprocess.run(
-                [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
-                capture_output=True, text=True, check=True
-            )
-            duration = float(dur_out.stdout.strip())
-            if duration <= 0:
-                raise ValueError("Invalid duration")
-
-            # Estimate number of chunks
-            avg_bitrate = (total_size * 8) / duration
-            chunk_time = (max_size_bytes * 8 * 0.9) / avg_bitrate
-            if chunk_time <= 0:
-                raise ValueError("Ridiculous chunk time")
-
-            start = 0.0
-            idx = 1
-            parts = []
-            while start < duration:
-                end = min(start + chunk_time, duration)
-                out_path = os.path.join(out_dir, f"chunk_{idx:03d}.mp4")
-                cmd = [
-                    ffmpeg, "-y", "-ss", str(start), "-to", str(end),
-                    "-i", video_path,
-                    "-c:v", "libx264", "-crf", "23", "-c:a", "aac",
-                    "-fs", str(max_size_bytes),
-                    "-movflags", "+faststart",
-                    out_path
-                ]
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-                # check duration of output
-                try:
-                    cd_out = subprocess.run(
-                        [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", out_path],
-                        capture_output=True, text=True, check=True
-                    )
-                    chunk_dur = float(cd_out.stdout.strip())
-                    if chunk_dur <= 0 or chunk_dur < 0.5:
-                        raise ValueError("Too small chunk")
-                except Exception:
-                    # If duration extraction fails but file exists, still use it
-                    pass
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            if os.path.getsize(out_path) <= MAX_SEND_SIZE:
                 parts.append(out_path)
-                start = end
-                idx += 1
-            # Verify sizes
-            if all(os.path.getsize(p) <= max_size_bytes for p in parts):
-                return parts
-            logger.info("ffmpeg re-encode chunks still too large, falling back to binary")
+            else:
+                logger.warning(f"Chunk {idx} exceeds MAX_SEND_SIZE despite keyframe alignment")
+                # Fallback for that chunk: binary split (but still add)
+                sub_parts = split_file_binary(out_path, original_filename=os.path.basename(out_path))
+                parts.extend(sub_parts)
+                safe_remove(out_path)
         except Exception as e:
-            logger.warning(f"ffmpeg re-encode split failed: {e}")
+            logger.error(f"ffmpeg cut failed for chunk {idx}: {e}")
+            if chat_id:
+                send_message(chat_id, f"⚠️ برش قطعه {idx} با خطا مواجه شد.")
 
-    # Layer 3: Binary split as last resort
-    logger.warning("⚠️ Both MP4Box and ffmpeg re-encode failed – falling back to binary split (non-playable)")
-    return split_file_binary(video_path, original_filename=os.path.basename(video_path))
+    return parts if parts else [video_path]
 
 def download_thumbnail(video_id: str, save_dir: str) -> Optional[str]:
     base = "https://img.youtube.com/vi/{}/{}"
@@ -392,6 +432,20 @@ def check_vip_code(code: str, chat_id: int) -> Tuple[bool, str]:
             return False, "❌ این کد در حال حاضر توسط کاربر دیگری استفاده می‌شود."
     data[code] = {"used_by": chat_id, "used_at": now}
     save_vip_data(data)
+
+    # Auto-register user if not already in users.json
+    users_data = load_users()
+    if str(chat_id) not in users_data["users"]:
+        users_data["users"][str(chat_id)] = {
+            "quota_used_bytes": 0, "quota_reset_time": 0.0,
+            "quality": "720p", "send_mode": "playable",
+            "preview_mode": "thumbnail", "video_mode": "document",
+            "photo_mode": "showable", "result_count": 10,
+            "search_mode": "relevance", "search_method": "scrapetube",
+            "info_method": "playwright", "download_method": "auto",
+            "target_channel": 0
+        }
+        save_users(users_data)
     return True, "✅ کد VIP با موفقیت فعال شد."
 
 # ---------- User & Quota Management ----------
@@ -468,25 +522,6 @@ def add_quota_usage(chat_id: int, bytes_used: int) -> None:
         user["quota_reset_time"] = now + QUOTA_SECONDS
     user["quota_used_bytes"] += bytes_used
     save_users(data)
-
-def add_user(target_id: int) -> Tuple[bool, str]:
-    data = load_users()
-    if target_id == data["admin_id"]:
-        return False, "⚠️ ادمین نیازی به افزودن ندارد."
-    uid = str(target_id)
-    if uid in data["users"]:
-        return False, "⚠️ کاربر قبلاً اضافه شده است."
-    data["users"][uid] = {
-        "quota_used_bytes": 0, "quota_reset_time": 0.0,
-        "quality": "720p", "send_mode": "playable",
-        "preview_mode": "thumbnail", "video_mode": "document",
-        "photo_mode": "showable", "result_count": 10,
-        "search_mode": "relevance", "search_method": "scrapetube",
-        "info_method": "playwright", "download_method": "auto",
-        "target_channel": 0
-    }
-    save_users(data)
-    return True, f"✅ کاربر {target_id} اضافه شد."
 
 def set_admin(caller_id: int, new_admin: int) -> Tuple[bool, str]:
     if not is_admin(caller_id):
@@ -729,7 +764,6 @@ def get_channel_info_exact(channel_id: str) -> Optional[Dict[str, Any]]:
             pass
         name = page.evaluate("document.querySelector('#channel-header yt-formatted-string')?.textContent?.trim() || ''")
         subs = page.evaluate("document.querySelector('#subscriber-count')?.textContent?.trim() || ''")
-        # updated selector for videos tab
         videos_count = page.evaluate("""() => {
             const tabs = document.querySelectorAll('yt-tab-shape, tp-yt-paper-tab');
             const vtab = [...tabs].find(el => el.textContent.includes('Videos'));
@@ -744,8 +778,6 @@ def get_channel_info_exact(channel_id: str) -> Optional[Dict[str, Any]]:
         if page: page.close()
         if browser: browser.close()
         if pw: pw.stop()
-
-# Removed search_channels_playwright and related functions.
 
 def get_channel_videos_playwright(channel_id: str, limit: int = 50) -> List[Dict[str, str]]:
     pw = browser = page = None
@@ -802,13 +834,29 @@ def get_channel_videos_playwright(channel_id: str, limit: int = 50) -> List[Dict
 def _download_ytdlp(video_id: str, quality: str, save_dir: str) -> Optional[str]:
     video_path = os.path.join(save_dir, f"{video_id}.mp4")
     try:
-        height = quality.replace("p", "")
+        profile = QUALITY_PROFILES.get(quality, QUALITY_PROFILES["720p"])
+        height = profile["height"]
+        vcodec = profile["vcodec"]
+        fmt = (
+            f"bestvideo[height<={height}][vcodec*={vcodec}][ext=mp4]"
+            f"+bestaudio[ext=m4a]/best[height<={height}]"
+        )
+        max_bitrate = profile["max_bitrate"]
+        # Convert bitrate to numeric for bufsize
+        bitrate_str = max_bitrate.replace("M", "e6").replace("k", "e3")
+        try:
+            bitrate_val = float(bitrate_str)
+        except ValueError:
+            bitrate_val = 2.5e6
+        bufsize = int(bitrate_val * 2)
+
         cmd = [
             "yt-dlp",
             "--remote-components", "ejs:github",
             "--js-runtimes", "deno",
-            "-f", f"bv*[height<={height}]+ba/b[height<={height}]",
+            "-f", fmt,
             "-o", video_path,
+            "--postprocessor-args", f"ffmpeg:-b:v {max_bitrate} -maxrate {max_bitrate} -bufsize {bufsize}",
             "--no-playlist",
             f"https://www.youtube.com/watch?v={video_id}"
         ]
@@ -910,8 +958,9 @@ def send_video_parts(parts: List[str], chat_id: int, video_mode: str = "document
                 send_message(chat_id, f"⛔ ارسال پارت {i} به‌دلیل اتمام وقت متوقف شد.")
                 return False
             try:
-                if video_mode == "showable" and send_mode == "playable" and i == 1:
-                    res = sendVideo(chat_id, part, caption="")
+                if video_mode == "showable" and send_mode == "playable":
+                    caption = "" if i == 1 else f"ادامه ویدیو... (بخش {i})"
+                    res = sendVideo(chat_id, part, caption=caption)
                 else:
                     caption = "ادامه ویدیو..." if i > 1 else ""
                     res = send_document(chat_id, part, caption=caption)
@@ -1056,7 +1105,7 @@ def handle_info(chat_id: int, video_id: str, index: int) -> None:
 def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = False) -> None:
     allowed, msg = check_quota_before(chat_id, QUOTA_THRESHOLD)
     if not allowed:
-        send_message(chat_id, msg)
+        send_message(chat_id, msg)  # error to user's PV
         return
 
     settings = get_user_settings(chat_id)
@@ -1066,8 +1115,8 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
     download_method = settings.get("download_method", "auto")
     target_channel = settings.get("target_channel", 0)
 
-    # Determine actual recipient
     destination = int(target_channel) if target_channel else chat_id
+    report_chat_id = chat_id  # errors always go to user
 
     job_id = uuid.uuid4().hex[:8]
     save_dir = f"downloads/{chat_id}/{job_id}"
@@ -1075,35 +1124,35 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
 
     start_time = time.time()
     try:
-        send_message(destination, "📥 دانلود ویدیو آغاز شد...")
+        send_message(destination, "📥 دانلود ویدیو آغاز شد...")  # progress to channel/group if set
         video_path = download_video(video_id, quality, save_dir, method=download_method)
         if not video_path or not os.path.exists(video_path):
-            send_message(destination, "❌ دانلود ویدیو ناموفق بود.")
+            send_message(report_chat_id, "❌ دانلود ویدیو ناموفق بود.")
             return
 
         file_size = os.path.getsize(video_path)
         if file_size == 0:
-            send_message(destination, "❌ فایل دانلود شده خراب است (حجم صفر).")
+            send_message(report_chat_id, "❌ فایل دانلود شده خراب است (حجم صفر).")
             safe_remove(video_path)
             return
 
         add_quota_usage(chat_id, file_size)
 
         if send_mode == "playable":
-            parts = split_video_by_size(video_path, MAX_SEND_SIZE)
+            parts = split_video_by_keyframes(video_path, chat_id=destination)
         else:
             zip_base = os.path.splitext(video_path)[0]
             zip_path = f"{zip_base}.zip"
             shutil.make_archive(zip_base, 'zip', os.path.dirname(video_path), os.path.basename(video_path))
             if not os.path.exists(zip_path) or os.path.getsize(zip_path) == 0:
-                send_message(destination, "❌ خطا در فشرده‌سازی فایل.")
+                send_message(report_chat_id, "❌ خطا در فشرده‌سازی فایل.")
                 safe_remove(video_path)
                 return
             parts = split_file_binary(zip_path, original_filename=os.path.basename(zip_path))
             safe_remove(zip_path)
 
         if not parts:
-            send_message(destination, "⛔ خطا در آماده‌سازی فایل برای ارسال.")
+            send_message(report_chat_id, "⛔ خطا در آماده‌سازی فایل برای ارسال.")
             return
 
         if send_video_parts(parts, destination, video_mode, send_mode):
@@ -1123,10 +1172,10 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
             )
             send_message(destination, report)
         else:
-            send_message(destination, "⚠️ ارسال ویدیو با مشکل مواجه شد.")
+            send_message(report_chat_id, "⚠️ ارسال ویدیو با مشکل مواجه شد.")
     except Exception as e:
         logger.exception("download flow error")
-        send_message(destination if target_channel else chat_id, f"⛔ خطایی رخ داد: {str(e)[:200]}")
+        send_message(report_chat_id, f"⛔ خطایی رخ داد: {str(e)[:200]}")
     finally:
         shutil.rmtree(save_dir, ignore_errors=True)
 
@@ -1240,8 +1289,6 @@ def handle_channel_exact(chat_id: int, channel_id: str) -> None:
     keyboard = {"inline_keyboard": [[{"text": "📋 ویدیوها", "callback_data": f"channel_videos|{channel_id}"}]]}
     send_message(chat_id, "می‌خواهید ویدیوهای این کانال را ببینید؟", reply_markup=keyboard)
 
-# Removed handle_channel_name_search function
-
 def handle_channel_videos(chat_id: int, channel_id: str) -> None:
     send_message(chat_id, "⏳ در حال دریافت ویدیوهای کانال...")
     limit = 100
@@ -1309,6 +1356,13 @@ def handle_link_confirm(chat_id: int, video_id: str) -> None:
 
 # ---------- Command processor ----------
 def process_message(chat_id: int, text: str) -> None:
+    # Silently ignore messages from channels except specific commands
+    if chat_id < 0:
+        if text.startswith("/set_channel") or text.startswith("/unset_channel"):
+            pass
+        else:
+            return
+
     if not is_admin(chat_id) and not is_vip(chat_id):
         if text not in ("/start", "/help", "/vip") and not text.startswith("/vip "):
             send_message(chat_id, "⛔ لطفاً کد VIP را وارد کنید: /vip <code>")
@@ -1380,21 +1434,29 @@ def process_message(chat_id: int, text: str) -> None:
             "/settings - تنظیمات\n"
             "📥 با دکمه «دانلود با لینک» لینک مستقیم بفرستید.\n"
             "📺 با دکمه «جستجوی کانال» کانال‌ها را بگردید.\n"
-            "📌 ادمین: /add_user شناسه, /set_channel, /unset_channel"
+            "📌 ادمین: /panel, /setadmin, /set_channel, /unset_channel"
         )
         send_message(chat_id, help_text)
-    elif text.startswith("/add_user") and is_admin(chat_id):
-        parts = text.split()
-        if len(parts) == 2:
-            try:
-                uid = int(parts[1])
-                ok, resp = add_user(uid)
-                send_message(chat_id, resp)
-            except ValueError:
-                send_message(chat_id, "❌ شناسه نامعتبر.")
+    elif text == "/panel" and is_admin(chat_id):
+        data = load_users()
+        users = data.get("users", {})
+        if not users:
+            send_message(chat_id, "هیچ کاربر VIP یافت نشد.")
         else:
-            send_message(chat_id, "❌ فرمت: /add_user 123456789")
-    elif text.startswith("/set_admin") and is_admin(chat_id):  # (keep for legacy)
+            lines = ["📊 پنل مدیریت:", "کاربران VIP:"]
+            for uid, u in users.items():
+                if int(uid) == data["admin_id"]:
+                    continue
+                used_mb = u.get("quota_used_bytes", 0) / (1024 * 1024)
+                reset_ts = u.get("quota_reset_time", 0)
+                if reset_ts:
+                    from datetime import datetime
+                    reset_str = datetime.fromtimestamp(reset_ts).strftime("%H:%M")
+                else:
+                    reset_str = "—"
+                lines.append(f"👤 {uid} | مصرف: {used_mb:.1f}MB | ریست: {reset_str}")
+            send_message(chat_id, "\n".join(lines))
+    elif text.startswith("/setadmin") and is_admin(chat_id):
         parts = text.split()
         if len(parts) == 2:
             try:
@@ -1420,6 +1482,7 @@ def process_message(chat_id: int, text: str) -> None:
                 channel_id = int(parts[1])
                 update_user_setting(chat_id, "target_channel", channel_id)
                 send_message(chat_id, f"✅ ارسال خودکار به کانال {channel_id} فعال شد.")
+                send_message(channel_id, "✅ ربات برای آپلود خودکار روی این کانال تنظیم شد.")
             except ValueError:
                 send_message(chat_id, "❌ آیدی کانال نامعتبر.")
         else:
@@ -1528,6 +1591,10 @@ def info_method_keyboard(current: str) -> Dict:
 
 # ---------- Callback Handler ----------
 def process_callback(chat_id: int, data: str, message_id: int, callback_query_id: str) -> None:
+    # Silently ignore callbacks from channels
+    if chat_id < 0:
+        return
+
     toast_text = ""
     if data == "search":
         with state_lock:
@@ -1538,7 +1605,6 @@ def process_callback(chat_id: int, data: str, message_id: int, callback_query_id
             USER_STATE[chat_id] = "awaiting_url"
         edit_message_text(chat_id, message_id, "📥 لینک ویدیوی یوتیوب را بفرستید:")
     elif data == "search_channel":
-        # Directly await exact channel ID
         with state_lock:
             USER_STATE[chat_id] = "awaiting_channel_exact"
         edit_message_text(chat_id, message_id, "📌 آیدی کانال (مثلاً @Google یا UCxxx) را بفرستید:")
@@ -1664,8 +1730,6 @@ def process_callback(chat_id: int, data: str, message_id: int, callback_query_id
         edit_message_text(chat_id, message_id, "❌ دانلود لغو شد.")
     elif data == "main_menu":
         edit_message_text(chat_id, message_id, "🏠 منوی اصلی:", reply_markup=main_menu())
-    else:
-        pass
     answer_callback_query(callback_query_id, toast_text)
 
 # ---------- Main ----------
@@ -1680,7 +1744,6 @@ def main():
                 time.sleep(2)
                 continue
             for upd in resp.get("result", []):
-                # Handle channel member updates
                 if "my_chat_member" in upd:
                     chat = upd["my_chat_member"]["chat"]
                     new_status = upd["my_chat_member"]["new_chat_member"]["status"]
