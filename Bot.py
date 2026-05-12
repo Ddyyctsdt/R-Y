@@ -48,8 +48,7 @@ state_lock = threading.Lock()
 users_lock = threading.Lock()
 vip_lock = threading.Lock()
 
-# Replace simple SEARCH_RESULTS with richer state
-SEARCH_STATE: Dict[int, Dict[str, Any]] = {}   # chat_id -> {query, search_type, offset, all_video_ids, channel_id}
+SEARCH_STATE: Dict[int, Dict[str, Any]] = {}
 USER_STATE: Dict[int, str] = {}
 PENDING_DOWNLOADS: Dict[int, str] = {}
 
@@ -112,7 +111,7 @@ def download_file(url: str, save_dir: str, filename: Optional[str] = None, timeo
         return None
 
 def split_file_binary(file_path: str, original_filename: Optional[str] = None) -> List[str]:
-    """Only used for zip parts. Not for mp4."""
+    """Only used for zip parts or last-resort video split."""
     out_dir = os.path.dirname(file_path) or "."
     if original_filename is None:
         original_filename = os.path.basename(file_path)
@@ -131,8 +130,9 @@ def split_file_binary(file_path: str, original_filename: Optional[str] = None) -
             part_num += 1
     return part_paths
 
-def split_video_by_size(video_path: str, max_size_bytes: int = MAX_SEND_SIZE, depth: int = 0) -> List[str]:
-    """Split video into playable chunks ≤ max_size_bytes. depth prevents infinite recursion."""
+def split_video_by_size(video_path: str, max_size_bytes: int = MAX_SEND_SIZE) -> List[str]:
+    """Split video into chunks ≤ max_size_bytes.
+    Tries in order: MP4Box, ffmpeg re-encode, binary split."""
     if not os.path.exists(video_path):
         return []
     total_size = os.path.getsize(video_path)
@@ -141,90 +141,86 @@ def split_video_by_size(video_path: str, max_size_bytes: int = MAX_SEND_SIZE, de
         shutil.copy2(video_path, dest)
         return [dest]
 
+    out_dir = os.path.dirname(video_path)
+
+    # Layer 1: MP4Box
+    mp4box = shutil.which("MP4Box")
+    if mp4box:
+        try:
+            max_size_kb = max_size_bytes // 1024
+            cmd = [mp4box, "-splits", str(max_size_kb), video_path]
+            subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=out_dir)
+            # MP4Box produces files like video_basename_001.mp4
+            basename_no_ext = os.path.splitext(os.path.basename(video_path))[0]
+            pattern = re.compile(rf"{re.escape(basename_no_ext)}_\d{{3}}\.mp4$")
+            parts = sorted([
+                os.path.join(out_dir, f) for f in os.listdir(out_dir) if pattern.match(f)
+            ])
+            if parts and all(os.path.getsize(p) <= max_size_bytes for p in parts):
+                return parts
+            logger.info("MP4Box produced files but some too large, falling back")
+        except Exception as e:
+            logger.warning(f"MP4Box split failed: {e}")
+
+    # Layer 2: ffmpeg with re-encode to guarantee size limit
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
-    if not ffmpeg or not ffprobe:
-        logger.error("ffmpeg/ffprobe not found")
-        return []
+    if ffmpeg and ffprobe:
+        try:
+            dur_out = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
+                capture_output=True, text=True, check=True
+            )
+            duration = float(dur_out.stdout.strip())
+            if duration <= 0:
+                raise ValueError("Invalid duration")
 
-    out_dir = os.path.dirname(video_path)
-    # Method 1: segment_size
-    try:
-        cmd = [
-            ffmpeg, "-y", "-i", video_path,
-            "-c", "copy", "-map", "0",
-            "-f", "segment", "-segment_size", str(max_size_bytes),
-            "-reset_timestamps", "1",
-            os.path.join(out_dir, "chunk_%03d.mp4")
-        ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        parts = sorted([
-            os.path.join(out_dir, f) for f in os.listdir(out_dir)
-            if re.match(r"chunk_\d{3}\.mp4$", f)
-        ])
-        if parts and all(os.path.getsize(p) <= max_size_bytes for p in parts):
-            return parts
-    except subprocess.CalledProcessError:
-        logger.info("segment_size failed, falling back to -fs method")
+            # Estimate number of chunks
+            avg_bitrate = (total_size * 8) / duration
+            chunk_time = (max_size_bytes * 8 * 0.9) / avg_bitrate
+            if chunk_time <= 0:
+                raise ValueError("Ridiculous chunk time")
 
-    # Method 2: -fs based segmentation
-    try:
-        dur_result = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
-            capture_output=True, text=True, check=True
-        )
-        duration = float(dur_result.stdout.strip())
-        if duration <= 0:
-            return []
-        start = 0.0
-        idx = 1
-        parts = []
-        while start < duration:
-            out_path = os.path.join(out_dir, f"chunk_{idx:03d}.mp4")
-            cmd = [
-                ffmpeg, "-y", "-ss", str(start), "-i", video_path,
-                "-fs", str(max_size_bytes),
-                "-c", "copy", "-movflags", "+faststart",
-                out_path
-            ]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-            chunk_dur_cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", out_path]
-            try:
-                chunk_dur_output = subprocess.run(chunk_dur_cmd, capture_output=True, text=True, check=True)
-                chunk_duration = float(chunk_dur_output.stdout.strip())
-                if chunk_duration <= 0:
-                    raise ValueError("Zero duration")
-            except Exception:
-                logger.error("Failed to get chunk duration")
-                return []
-            # If chunk duration is too small, abort to avoid infinite loop
-            if chunk_duration < 0.5:
-                logger.error("Chunk duration too small, aborting split")
-                return []
-            parts.append(out_path)
-            start += chunk_duration
-            idx += 1
-        # Ensure size limit; if oversized, recursively split (with depth limit)
-        final_parts = []
-        for p in parts:
-            if os.path.getsize(p) > max_size_bytes:
-                if depth >= 3:
-                    logger.warning(f"⚠️ Chunk still oversized after 3 attempts, using binary split for {p}")
-                    # last resort: binary split (non-playable but necessary)
-                    binary_parts = split_file_binary(p, original_filename=os.path.basename(p))
-                    final_parts.extend(binary_parts)
-                    safe_remove(p)
-                else:
-                    logger.info(f"Chunk {p} still too large, re-splitting (depth {depth})")
-                    sub_parts = split_video_by_size(p, max_size_bytes, depth + 1)
-                    final_parts.extend(sub_parts)
-                    safe_remove(p)
-            else:
-                final_parts.append(p)
-        return final_parts
-    except Exception as e:
-        logger.error(f"Manual split with -fs failed: {e}")
-        return []
+            start = 0.0
+            idx = 1
+            parts = []
+            while start < duration:
+                end = min(start + chunk_time, duration)
+                out_path = os.path.join(out_dir, f"chunk_{idx:03d}.mp4")
+                cmd = [
+                    ffmpeg, "-y", "-ss", str(start), "-to", str(end),
+                    "-i", video_path,
+                    "-c:v", "libx264", "-crf", "23", "-c:a", "aac",
+                    "-fs", str(max_size_bytes),
+                    "-movflags", "+faststart",
+                    out_path
+                ]
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                # check duration of output
+                try:
+                    cd_out = subprocess.run(
+                        [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", out_path],
+                        capture_output=True, text=True, check=True
+                    )
+                    chunk_dur = float(cd_out.stdout.strip())
+                    if chunk_dur <= 0 or chunk_dur < 0.5:
+                        raise ValueError("Too small chunk")
+                except Exception:
+                    # If duration extraction fails but file exists, still use it
+                    pass
+                parts.append(out_path)
+                start = end
+                idx += 1
+            # Verify sizes
+            if all(os.path.getsize(p) <= max_size_bytes for p in parts):
+                return parts
+            logger.info("ffmpeg re-encode chunks still too large, falling back to binary")
+        except Exception as e:
+            logger.warning(f"ffmpeg re-encode split failed: {e}")
+
+    # Layer 3: Binary split as last resort
+    logger.warning("⚠️ Both MP4Box and ffmpeg re-encode failed – falling back to binary split (non-playable)")
+    return split_file_binary(video_path, original_filename=os.path.basename(video_path))
 
 def download_thumbnail(video_id: str, save_dir: str) -> Optional[str]:
     base = "https://img.youtube.com/vi/{}/{}"
@@ -414,7 +410,8 @@ def load_users() -> Dict:
                 "preview_mode": "thumbnail", "video_mode": "document",
                 "photo_mode": "showable", "result_count": 10,
                 "search_mode": "relevance", "search_method": "scrapetube",
-                "info_method": "playwright", "download_method": "auto"
+                "info_method": "playwright", "download_method": "auto",
+                "target_channel": 0
             }
         for u in data["users"].values():
             u.setdefault("quota_used_bytes", 0)
@@ -429,6 +426,7 @@ def load_users() -> Dict:
             u.setdefault("search_method", "scrapetube")
             u.setdefault("info_method", "playwright")
             u.setdefault("download_method", "auto")
+            u.setdefault("target_channel", 0)
     return data
 
 def save_users(data: Dict) -> None:
@@ -484,7 +482,8 @@ def add_user(target_id: int) -> Tuple[bool, str]:
         "preview_mode": "thumbnail", "video_mode": "document",
         "photo_mode": "showable", "result_count": 10,
         "search_mode": "relevance", "search_method": "scrapetube",
-        "info_method": "playwright", "download_method": "auto"
+        "info_method": "playwright", "download_method": "auto",
+        "target_channel": 0
     }
     save_users(data)
     return True, f"✅ کاربر {target_id} اضافه شد."
@@ -504,7 +503,8 @@ def get_user_settings(chat_id: int) -> Dict:
         "preview_mode": "thumbnail", "video_mode": "document",
         "photo_mode": "showable", "result_count": 10,
         "search_mode": "relevance", "search_method": "scrapetube",
-        "info_method": "playwright", "download_method": "auto"
+        "info_method": "playwright", "download_method": "auto",
+        "target_channel": 0
     })
 
 def update_user_setting(chat_id: int, key: str, value: Any) -> None:
@@ -557,13 +557,12 @@ def _search_ytdlp(query: str, limit: int) -> List[Dict[str, str]]:
         logger.error(f"yt-dlp search error: {e}")
         return []
 
-# InnerTube search placeholder (not implemented, returns empty)
 def _search_innertube(query: str, limit: int) -> List[Dict[str, str]]:
     return []
 
 # ---------- Info Methods ----------
 def _info_playwright(video_id: str) -> Optional[Dict[str, Any]]:
-    return scrape_watch_page(video_id)  # defined later
+    return scrape_watch_page(video_id)
 
 def _info_ytdlp(video_id: str) -> Optional[Dict[str, Any]]:
     try:
@@ -605,7 +604,7 @@ def _info_oembed(video_id: str) -> Optional[Dict[str, Any]]:
         pass
     return None
 
-# ---------- Playwright scraping (used by info and channel) ----------
+# ---------- Playwright scraping ----------
 def scrape_watch_page(video_id: str) -> Optional[Dict[str, Any]]:
     pw = browser = context = page = None
     screenshot_path = None
@@ -730,7 +729,12 @@ def get_channel_info_exact(channel_id: str) -> Optional[Dict[str, Any]]:
             pass
         name = page.evaluate("document.querySelector('#channel-header yt-formatted-string')?.textContent?.trim() || ''")
         subs = page.evaluate("document.querySelector('#subscriber-count')?.textContent?.trim() || ''")
-        videos_count = page.evaluate("document.querySelectorAll('yt-tab-shape')[1]?.textContent?.trim() || ''")
+        # updated selector for videos tab
+        videos_count = page.evaluate("""() => {
+            const tabs = document.querySelectorAll('yt-tab-shape, tp-yt-paper-tab');
+            const vtab = [...tabs].find(el => el.textContent.includes('Videos'));
+            return vtab ? vtab.textContent.trim() : '';
+        }""")
         avatar = page.evaluate("document.querySelector('#img')?.getAttribute('src') || ''")
         return {"name": name, "subscribers": subs, "videos_count": videos_count, "avatar": avatar, "channel_id": channel_id}
     except Exception as e:
@@ -741,53 +745,7 @@ def get_channel_info_exact(channel_id: str) -> Optional[Dict[str, Any]]:
         if browser: browser.close()
         if pw: pw.stop()
 
-def search_channels_playwright(query: str, limit: int = 10) -> List[Dict[str, str]]:
-    pw = browser = page = None
-    try:
-        encoded = requests.utils.quote(query)
-        url = f"https://www.youtube.com/results?search_query={encoded}&sp=EgIQAg%3D%3D"
-        pw = sync_playwright().start()
-        browser = pw.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=USER_AGENT)
-        add_cookies_to_context(context)
-        page = context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=SEARCH_TIMEOUT*1000)
-        try:
-            page.wait_for_selector("ytd-channel-renderer", timeout=10000)
-        except PlaywrightTimeout:
-            pass
-        for _ in range(3):
-            page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
-            time.sleep(1)
-        channels = page.evaluate("""
-        (limit) => {
-            const items = document.querySelectorAll('ytd-channel-renderer');
-            const res = [];
-            for (const item of items) {
-                if (res.length >= limit) break;
-                const nameEl = item.querySelector('#channel-title yt-formatted-string');
-                const name = nameEl ? nameEl.textContent.trim() : '';
-                const subsEl = item.querySelector('#subscriber-count');
-                const subs = subsEl ? subsEl.textContent.trim() : '';
-                const avatarEl = item.querySelector('#avatar img');
-                const avatar = avatarEl ? avatarEl.getAttribute('src') : '';
-                const linkEl = item.querySelector('#main-link');
-                const href = linkEl ? linkEl.getAttribute('href') : '';
-                const idMatch = href.match(/\\/(@[^/]+|channel\\/UC[\\w-]+)/);
-                const channelId = idMatch ? idMatch[1].replace('channel/', '') : '';
-                res.push({name, subscribers: subs, avatar, channel_id: channelId});
-            }
-            return res;
-        }
-        """, limit)
-        return channels
-    except Exception as e:
-        logger.error(f"search_channels_playwright error: {e}")
-        return []
-    finally:
-        if page: page.close()
-        if browser: browser.close()
-        if pw: pw.stop()
+# Removed search_channels_playwright and related functions.
 
 def get_channel_videos_playwright(channel_id: str, limit: int = 50) -> List[Dict[str, str]]:
     pw = browser = page = None
@@ -806,7 +764,6 @@ def get_channel_videos_playwright(channel_id: str, limit: int = 50) -> List[Dict
             page.wait_for_selector("ytd-rich-grid-media, ytd-video-renderer", timeout=10000)
         except PlaywrightTimeout:
             pass
-        # scroll to load more
         prev = 0
         for _ in range(10):
             page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
@@ -938,7 +895,7 @@ def download_video(video_id: str, quality: str, save_dir: str, method: str = "au
     else:
         return _download_ytdlp(video_id, quality, save_dir)
 
-# ---------- Send parts (no oversize handling anymore because pre-split guarantees) ----------
+# ---------- Send parts ----------
 def send_video_parts(parts: List[str], chat_id: int, video_mode: str = "document",
                      send_mode: str = "playable") -> bool:
     total = len(parts)
@@ -1054,7 +1011,6 @@ def handle_info(chat_id: int, video_id: str, index: int) -> None:
     duration_display = seconds_to_display(duration_raw) if isinstance(duration_raw, (int, float)) else str(duration_raw)
     desc = info.get("description", "")
 
-    # Build caption exactly as specified
     caption = (
         f"📹 {title}\n"
         f"👤 {uploader}\n"
@@ -1070,7 +1026,6 @@ def handle_info(chat_id: int, video_id: str, index: int) -> None:
         caption += "📝 —\n"
     caption += f"🔗 https://youtube.com/watch?v={video_id}\n📥 /dl_{index}"
 
-    # Send description as file if long
     if desc and len(desc) > 200:
         desc_path = f"downloads/{chat_id}/{video_id}_desc.txt"
         os.makedirs(os.path.dirname(desc_path), exist_ok=True)
@@ -1109,6 +1064,10 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
     send_mode = settings.get("send_mode", "playable")
     video_mode = settings.get("video_mode", "document")
     download_method = settings.get("download_method", "auto")
+    target_channel = settings.get("target_channel", 0)
+
+    # Determine actual recipient
+    destination = int(target_channel) if target_channel else chat_id
 
     job_id = uuid.uuid4().hex[:8]
     save_dir = f"downloads/{chat_id}/{job_id}"
@@ -1116,15 +1075,15 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
 
     start_time = time.time()
     try:
-        send_message(chat_id, "📥 دانلود ویدیو آغاز شد...")
+        send_message(destination, "📥 دانلود ویدیو آغاز شد...")
         video_path = download_video(video_id, quality, save_dir, method=download_method)
         if not video_path or not os.path.exists(video_path):
-            send_message(chat_id, "❌ دانلود ویدیو ناموفق بود.")
+            send_message(destination, "❌ دانلود ویدیو ناموفق بود.")
             return
 
         file_size = os.path.getsize(video_path)
         if file_size == 0:
-            send_message(chat_id, "❌ فایل دانلود شده خراب است (حجم صفر).")
+            send_message(destination, "❌ فایل دانلود شده خراب است (حجم صفر).")
             safe_remove(video_path)
             return
 
@@ -1137,18 +1096,18 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
             zip_path = f"{zip_base}.zip"
             shutil.make_archive(zip_base, 'zip', os.path.dirname(video_path), os.path.basename(video_path))
             if not os.path.exists(zip_path) or os.path.getsize(zip_path) == 0:
-                send_message(chat_id, "❌ خطا در فشرده‌سازی فایل.")
+                send_message(destination, "❌ خطا در فشرده‌سازی فایل.")
                 safe_remove(video_path)
                 return
             parts = split_file_binary(zip_path, original_filename=os.path.basename(zip_path))
             safe_remove(zip_path)
 
         if not parts:
-            send_message(chat_id, "⛔ خطا در آماده‌سازی فایل برای ارسال.")
+            send_message(destination, "⛔ خطا در آماده‌سازی فایل برای ارسال.")
             return
 
-        if send_video_parts(parts, chat_id, video_mode, send_mode):
-            send_message(chat_id, "✅ ویدیو با موفقیت ارسال شد.")
+        if send_video_parts(parts, destination, video_mode, send_mode):
+            send_message(destination, "✅ ویدیو با موفقیت ارسال شد.")
             end_time = time.time()
             elapsed = end_time - start_time
             title = get_video_title(video_id)
@@ -1162,12 +1121,12 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
                 f"📦 تعداد پارت‌ها: {len(parts)}\n"
                 f"⏱ زمان کل: {elapsed:.1f} ثانیه"
             )
-            send_message(chat_id, report)
+            send_message(destination, report)
         else:
-            send_message(chat_id, "⚠️ ارسال ویدیو با مشکل مواجه شد.")
+            send_message(destination, "⚠️ ارسال ویدیو با مشکل مواجه شد.")
     except Exception as e:
         logger.exception("download flow error")
-        send_message(chat_id, f"⛔ خطایی رخ داد: {str(e)[:200]}")
+        send_message(destination if target_channel else chat_id, f"⛔ خطایی رخ داد: {str(e)[:200]}")
     finally:
         shutil.rmtree(save_dir, ignore_errors=True)
 
@@ -1281,22 +1240,7 @@ def handle_channel_exact(chat_id: int, channel_id: str) -> None:
     keyboard = {"inline_keyboard": [[{"text": "📋 ویدیوها", "callback_data": f"channel_videos|{channel_id}"}]]}
     send_message(chat_id, "می‌خواهید ویدیوهای این کانال را ببینید؟", reply_markup=keyboard)
 
-def handle_channel_name_search(chat_id: int, query: str) -> None:
-    results = search_channels_playwright(query, 10)
-    if not results:
-        send_message(chat_id, "❌ کانالی یافت نشد.")
-        return
-    for ch in results:
-        caption = f"📺 {ch['name']}\n👥 {ch['subscribers']}"
-        cb_data = f"channel_videos|{ch['channel_id']}"
-        keyboard = {"inline_keyboard": [[{"text": "📋 ویدیوها", "callback_data": cb_data}]]}
-        if ch.get("avatar"):
-            thumb = download_file(ch["avatar"], f"downloads/{chat_id}", f"ch_avatar_{uuid.uuid4().hex}.jpg")
-            if thumb:
-                sendPhoto(chat_id, thumb, caption=caption, reply_markup=keyboard)
-                safe_remove(thumb)
-                continue
-        send_message(chat_id, caption, reply_markup=keyboard)
+# Removed handle_channel_name_search function
 
 def handle_channel_videos(chat_id: int, channel_id: str) -> None:
     send_message(chat_id, "⏳ در حال دریافت ویدیوهای کانال...")
@@ -1323,9 +1267,14 @@ def handle_link_confirm(chat_id: int, video_id: str) -> None:
     title = info.get("title", "?")
     quality = get_user_settings(chat_id).get("quality", "720p")
     bitrate = BITRATE_TABLE.get(quality, 2e6)
-    duration = info.get("duration", 0)
-    if isinstance(duration, (int, float)):
-        estimated_size = (duration * bitrate) / 8
+
+    duration_raw = info.get("duration", 0)
+    if isinstance(duration_raw, str) and duration_raw.isdigit():
+        duration_raw = int(duration_raw)
+    duration_display = seconds_to_display(duration_raw) if isinstance(duration_raw, (int, float)) else "?"
+
+    if isinstance(duration_raw, (int, float)):
+        estimated_size = (duration_raw * bitrate) / 8
     else:
         estimated_size = 10 * 1024 * 1024
     size_mb = estimated_size / (1024 * 1024)
@@ -1334,6 +1283,7 @@ def handle_link_confirm(chat_id: int, video_id: str) -> None:
         f"📹 {title}\n"
         f"🔗 https://youtube.com/watch?v={video_id}\n"
         f"📏 کیفیت: {quality}\n"
+        f"⏱ زمان: {duration_display}\n"
         f"💾 حجم تخمینی: {size_mb:.1f} MB\n\n"
         "آیا دانلود انجام شود؟"
     )
@@ -1384,9 +1334,6 @@ def process_message(chat_id: int, text: str) -> None:
     if state == "awaiting_channel_exact" and not text.startswith("/"):
         handle_channel_exact(chat_id, text)
         return
-    if state == "awaiting_channel_name" and not text.startswith("/"):
-        handle_channel_name_search(chat_id, text)
-        return
 
     if text == "/start":
         send_message(chat_id, "🤖 به ربات YouTube Bale خوش آمدید!", reply_markup=main_menu())
@@ -1433,7 +1380,7 @@ def process_message(chat_id: int, text: str) -> None:
             "/settings - تنظیمات\n"
             "📥 با دکمه «دانلود با لینک» لینک مستقیم بفرستید.\n"
             "📺 با دکمه «جستجوی کانال» کانال‌ها را بگردید.\n"
-            "📌 ادمین: /add_user شناسه"
+            "📌 ادمین: /add_user شناسه, /set_channel, /unset_channel"
         )
         send_message(chat_id, help_text)
     elif text.startswith("/add_user") and is_admin(chat_id):
@@ -1447,7 +1394,7 @@ def process_message(chat_id: int, text: str) -> None:
                 send_message(chat_id, "❌ شناسه نامعتبر.")
         else:
             send_message(chat_id, "❌ فرمت: /add_user 123456789")
-    elif text.startswith("/setadmin") and is_admin(chat_id):
+    elif text.startswith("/set_admin") and is_admin(chat_id):  # (keep for legacy)
         parts = text.split()
         if len(parts) == 2:
             try:
@@ -1466,6 +1413,20 @@ def process_message(chat_id: int, text: str) -> None:
             send_message(chat_id, msg)
         else:
             send_message(chat_id, "❌ فرمت: /vip <code>")
+    elif text.startswith("/set_channel") and is_admin(chat_id):
+        parts = text.split()
+        if len(parts) == 2:
+            try:
+                channel_id = int(parts[1])
+                update_user_setting(chat_id, "target_channel", channel_id)
+                send_message(chat_id, f"✅ ارسال خودکار به کانال {channel_id} فعال شد.")
+            except ValueError:
+                send_message(chat_id, "❌ آیدی کانال نامعتبر.")
+        else:
+            send_message(chat_id, "❌ فرمت: /set_channel <channel_id>")
+    elif text == "/unset_channel" and is_admin(chat_id):
+        update_user_setting(chat_id, "target_channel", 0)
+        send_message(chat_id, "✅ ارسال خودکار به کانال غیرفعال شد. فایل‌ها به چت خصوصی شما ارسال می‌شوند.")
     else:
         send_message(chat_id, "⚠️ فرمان نامعتبر. از منوی زیر استفاده کنید:", reply_markup=main_menu())
 
@@ -1577,25 +1538,10 @@ def process_callback(chat_id: int, data: str, message_id: int, callback_query_id
             USER_STATE[chat_id] = "awaiting_url"
         edit_message_text(chat_id, message_id, "📥 لینک ویدیوی یوتیوب را بفرستید:")
     elif data == "search_channel":
-        keyboard = {"inline_keyboard": [
-            [{"text": "🔎 جستجوی دقیق (با آیدی)", "callback_data": "channel_exact"}],
-            [{"text": "🔍 جستجوی اسمی", "callback_data": "channel_name"}],
-            [{"text": "🔙 بازگشت", "callback_data": "main_menu"}]
-        ]}
-        edit_message_text(chat_id, message_id, "📺 روش جستجوی کانال:", reply_markup=keyboard)
-    elif data == "channel_exact":
+        # Directly await exact channel ID
         with state_lock:
             USER_STATE[chat_id] = "awaiting_channel_exact"
         edit_message_text(chat_id, message_id, "📌 آیدی کانال (مثلاً @Google یا UCxxx) را بفرستید:")
-    elif data == "channel_name":
-        with state_lock:
-            USER_STATE[chat_id] = "awaiting_channel_name"
-        edit_message_text(chat_id, message_id, "🔍 اسم کانال را تایپ کنید:")
-    elif data.startswith("channel_videos|"):
-        channel_id = data.split("|", 1)[1]
-        threading.Thread(target=handle_channel_videos, args=(chat_id, channel_id), daemon=True).start()
-        answer_callback_query(callback_query_id, "در حال دریافت ویدیوها...")
-        return
     elif data == "more_results":
         handle_more_results(chat_id)
     elif data == "help":
@@ -1718,6 +1664,8 @@ def process_callback(chat_id: int, data: str, message_id: int, callback_query_id
         edit_message_text(chat_id, message_id, "❌ دانلود لغو شد.")
     elif data == "main_menu":
         edit_message_text(chat_id, message_id, "🏠 منوی اصلی:", reply_markup=main_menu())
+    else:
+        pass
     answer_callback_query(callback_query_id, toast_text)
 
 # ---------- Main ----------
@@ -1732,6 +1680,17 @@ def main():
                 time.sleep(2)
                 continue
             for upd in resp.get("result", []):
+                # Handle channel member updates
+                if "my_chat_member" in upd:
+                    chat = upd["my_chat_member"]["chat"]
+                    new_status = upd["my_chat_member"]["new_chat_member"]["status"]
+                    if chat.get("type") == "channel" and new_status == "administrator":
+                        channel_name = chat.get("title", "?")
+                        channel_id = chat["id"]
+                        admin_id = load_users().get("admin_id", ADMIN_CHAT_ID)
+                        msg = f"🔔 ربات به کانال «{channel_name}» با آیدی {channel_id} اضافه شد.\nبرای فعال‌سازی ارسال خودکار دانلودها به این کانال، دستور زیر را بفرست:\n/set_channel {channel_id}"
+                        send_message(admin_id, msg)
+
                 if "message" in upd and "text" in upd["message"]:
                     msg = upd["message"]
                     chat_id = msg["chat"]["id"]
