@@ -1,6 +1,6 @@
 """
-bot.py - YouTube Bale Bot v4.3
-Complete rewrite with VIP, screenshot, video/photo modes, search modes, and more.
+bot.py - YouTube Bale Bot v4.4
+Stable release with yt-dlp primary download, fixed path splitting, smart Playwright wait, and increased download timeout.
 """
 
 import os, re, sys, time, json, math, uuid, shutil, threading, subprocess, traceback, logging
@@ -25,7 +25,7 @@ REQUEST_TIMEOUT = 30
 LONG_POLL_TIMEOUT = 50
 SEARCH_TIMEOUT = 90
 WATCH_TIMEOUT = 60
-DOWNLOAD_TIMEOUT = 180
+DOWNLOAD_TIMEOUT = 600                 # increased to 10 minutes
 QUOTA_THRESHOLD = 500 * 1024 * 1024    # 500 MB – minimum remaining quota to allow download
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -111,13 +111,16 @@ def download_file(url: str, save_dir: str, filename: Optional[str] = None, timeo
         logger.error(f"download_file error: {e}")
         return None
 
-def split_file_binary(file_path: str, prefix: str, ext: str) -> List[str]:
-    part_paths = []
+def split_file_binary(file_path: str, original_filename: Optional[str] = None) -> List[str]:
+    """
+    Split binary file into chunks of MAX_SEND_SIZE in the same directory.
+    Parts are named like original_filename.part001, original_filename.part002, ...
+    """
     out_dir = os.path.dirname(file_path) or "."
-    if ext == ".zip":
-        pattern = f"{prefix}.zip.{{:03d}}"
-    else:
-        pattern = f"{prefix}.part{{:03d}}{ext}"
+    if original_filename is None:
+        original_filename = os.path.basename(file_path)
+    pattern = f"{original_filename}.part{{:03d}}"
+    part_paths = []
     with open(file_path, "rb") as f:
         part_num = 1
         while True:
@@ -492,7 +495,11 @@ def _search_with_sp(query: str, limit: int, sp: str) -> List[Dict[str, str]]:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=SEARCH_TIMEOUT * 1000)
-        page.wait_for_selector("ytd-video-renderer", timeout=15000)
+        # Instead of hard wait, we wait for a selector briefly
+        try:
+            page.wait_for_selector("ytd-video-renderer", timeout=10000)
+        except PlaywrightTimeout:
+            pass
         for _ in range(5):
             page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
             time.sleep(1)
@@ -535,7 +542,11 @@ def scrape_watch_page(video_id: str) -> Optional[Dict[str, Any]]:
         page.set_viewport_size({"width": 720, "height": 1280})
         page.goto(f"https://www.youtube.com/watch?v={video_id}",
                   wait_until="domcontentloaded", timeout=WATCH_TIMEOUT * 1000)
-        page.wait_for_selector("h1 yt-formatted-string", timeout=15000)
+        # Smart wait for title element with retries
+        for _ in range(3):
+            page.wait_for_timeout(5000)
+            if page.query_selector("h1 yt-formatted-string"):
+                break
 
         try:
             expand = page.query_selector("#expand, #description-inline-expander button")
@@ -714,6 +725,27 @@ def handle_info(chat_id: int, video_id: str, index: int) -> None:
             send_message(chat_id, caption)   # fallback text only
 
 # ---------- Download & Upload ----------
+def _download_ytdlp(video_id: str, quality: str, save_dir: str) -> Optional[str]:
+    """Primary download method using yt-dlp."""
+    video_path = os.path.join(save_dir, f"{video_id}.mp4")
+    try:
+        height = quality.replace("p", "")
+        cmd = [
+            "yt-dlp",
+            "-f", f"bv*[height<={height}]+ba/b[height<={height}]",
+            "-o", video_path,
+            "--no-playlist",
+            f"https://www.youtube.com/watch?v={video_id}"
+        ]
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if os.path.exists(video_path):
+            return video_path
+    except subprocess.CalledProcessError as e:
+        logger.error(f"yt-dlp failed: {e.stderr}")
+    except Exception as e:
+        logger.error(f"yt-dlp error: {e}")
+    return None
+
 def _download_hubytconvert(video_id: str, quality: str, save_dir: str) -> Optional[str]:
     try:
         s = requests.Session()
@@ -755,25 +787,19 @@ def _download_hubytconvert(video_id: str, quality: str, save_dir: str) -> Option
     return None
 
 def _download_cobalt(video_id: str, quality: str, save_dir: str) -> Optional[str]:
-    try:
-        r = requests.post(
-            "https://api.cobalt.tools/api/json",
-            json={"url": f"https://youtube.com/watch?v={video_id}", "vCodec": "h264", "aFormat": "mp3"},
-            timeout=REQUEST_TIMEOUT * 2
-        )
-        r.raise_for_status()
-        stream_url = r.json().get("url") or r.json().get("streamUrl")
-        if stream_url:
-            return download_file(stream_url, save_dir, f"{video_id}.mp4", timeout=180)
-    except Exception as e:
-        logger.warning(f"cobalt failed: {e}")
+    # Disabled due to instability
     return None
 
 def download_video(video_id: str, quality: str, save_dir: str) -> Optional[str]:
+    """Try yt-dlp first, then hubytconvert."""
+    path = _download_ytdlp(video_id, quality, save_dir)
+    if path:
+        return path
     path = _download_hubytconvert(video_id, quality, save_dir)
     if path:
         return path
-    return _download_cobalt(video_id, quality, save_dir)
+    # Cobalt skipped
+    return None
 
 def send_video_parts(parts: List[str], chat_id: int, video_mode: str = "document",
                      send_mode: str = "playable") -> bool:
@@ -785,12 +811,13 @@ def send_video_parts(parts: List[str], chat_id: int, video_mode: str = "document
         part = parts[i]
         part_start = time.time()
 
-        # Oversize check
+        # Oversize check and split only if strictly necessary
         if os.path.getsize(part) > MAX_SEND_SIZE:
             logger.info(f"Part {i+1} oversized, splitting")
-            base, ext = os.path.splitext(part)
-            sub_parts = split_file_binary(part, base, ext)
+            fname = os.path.basename(part)
+            sub_parts = split_file_binary(part, original_filename=fname)
             safe_remove(part)
+            # Replace current part with sub-parts
             parts.pop(i)
             for j, sp in enumerate(sub_parts):
                 parts.insert(i + j, sp)
@@ -871,7 +898,7 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
             zip_base = os.path.splitext(video_path)[0]
             zip_path = f"{zip_base}.zip"
             shutil.make_archive(zip_base, 'zip', os.path.dirname(video_path), os.path.basename(video_path))
-            parts = split_file_binary(zip_path, os.path.splitext(os.path.basename(zip_path))[0], ".zip")
+            parts = split_file_binary(zip_path, original_filename=os.path.basename(zip_path))
             safe_remove(zip_path)
 
         if not parts:
@@ -1279,7 +1306,7 @@ def process_callback(chat_id: int, data: str, message_id: int, callback_query_id
 
 # ---------- Main ----------
 def main():
-    logger.info("YouTube Bale Bot v4.3 started")
+    logger.info("YouTube Bale Bot v4.4 started")
     os.makedirs("downloads", exist_ok=True)
     offset = 0
     while True:
