@@ -24,14 +24,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Create cookies file
-        run: echo "${{ secrets.YT_COOKIES }}" > cookies.txt
+      - name: Install Deno (JS Runtime for yt-dlp)
+        run: |
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
 
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests scrapetube playwright yt-dlp
           python -m playwright install --with-deps chromium
+
+      - name: Create cookies file
+        run: echo "${{ secrets.YT_COOKIES }}" > cookies.txt
 
       - name: Run bot (3 hours)
         env:
