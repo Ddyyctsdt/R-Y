@@ -88,6 +88,9 @@ def extract_video_id(url: str) -> Optional[str]:
 
 def download_file(url: str, save_dir: str, filename: Optional[str] = None, timeout: int = 120) -> Optional[str]:
     try:
+        # Fix protocol-relative URLs
+        if url.startswith("//"):
+            url = "https:" + url
         os.makedirs(save_dir, exist_ok=True)
         if not filename:
             filename = os.path.basename(requests.utils.urlparse(url).path) or "file"
@@ -193,6 +196,10 @@ def split_video_by_size(video_path: str, max_size_bytes: int = MAX_SEND_SIZE, de
                     raise ValueError("Zero duration")
             except Exception:
                 logger.error("Failed to get chunk duration")
+                return []
+            # If chunk duration is too small, abort to avoid infinite loop
+            if chunk_duration < 0.5:
+                logger.error("Chunk duration too small, aborting split")
                 return []
             parts.append(out_path)
             start += chunk_duration
@@ -523,7 +530,13 @@ def _search_scrapetube(query: str, limit: int) -> List[Dict[str, str]]:
 
 def _search_ytdlp(query: str, limit: int) -> List[Dict[str, str]]:
     try:
-        cmd = ["yt-dlp", "--flat-playlist", "--print", "%(id)s|%(title)s|%(duration)s", f"ytsearch{limit}:{query}"]
+        cmd = [
+            "yt-dlp",
+            "--remote-components", "ejs:github",
+            "--js-runtimes", "deno",
+            "--flat-playlist", "--print", "%(id)s|%(title)s|%(duration)s",
+            f"ytsearch{limit}:{query}"
+        ]
         if os.path.exists(COOKIE_FILE):
             cmd.insert(1, "--cookies")
             cmd.insert(2, COOKIE_FILE)
@@ -835,6 +848,8 @@ def _download_ytdlp(video_id: str, quality: str, save_dir: str) -> Optional[str]
         height = quality.replace("p", "")
         cmd = [
             "yt-dlp",
+            "--remote-components", "ejs:github",
+            "--js-runtimes", "deno",
             "-f", f"bv*[height<={height}]+ba/b[height<={height}]",
             "-o", video_path,
             "--no-playlist",
@@ -972,11 +987,9 @@ def send_video_parts(parts: List[str], chat_id: int, video_mode: str = "document
 def format_count(raw: str) -> str:
     if not raw:
         return "?"
-    # اگر از قبل فرمت‌شده است (مثل "1.2M")، همان را برگردان
     clean = raw.strip()
     if clean and clean[-1] in 'KM':
         return clean
-    # استخراج عدد اعشاری یا صحیح
     num_str = re.sub(r"[^\d.]", "", raw)
     if not num_str:
         return raw.strip() or "?"
@@ -993,20 +1006,25 @@ def format_count(raw: str) -> str:
         if formatted.endswith(".0K"):
             formatted = formatted[:-2] + "K"
     else:
-        formatted = str(int(num))  # اعداد کوچک اعشاری نمی‌خواهیم
+        formatted = str(int(num))
     return formatted
 
 def seconds_to_display(sec: int) -> str:
     if not isinstance(sec, (int, float)):
-        return str(sec)
+        if isinstance(sec, str) and sec.isdigit():
+            sec = int(sec)
+        else:
+            return str(sec)
     sec = int(sec)
-    if sec < 60:
-        return f"{sec} ثانیه"
-    mins = sec // 60
-    secs = sec % 60
-    if secs == 0:
-        return f"{mins} دقیقه"
-    return f"{mins} دقیقه {secs} ثانیه"
+    if sec >= 3600:
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        return f"{h}:{m:02d}:{s:02d}"
+    else:
+        m = sec // 60
+        s = sec % 60
+        return f"{m}:{s:02d}"
 
 # ---------- Info display ----------
 def handle_info(chat_id: int, video_id: str, index: int) -> None:
@@ -1031,19 +1049,28 @@ def handle_info(chat_id: int, video_id: str, index: int) -> None:
     uploader = info.get("uploader", "?")
     views = format_count(info.get("views", "?"))
     duration_raw = info.get("duration", "?")
-    # Convert string duration to int if needed (especially for yt-dlp)
     if isinstance(duration_raw, str) and duration_raw.isdigit():
         duration_raw = int(duration_raw)
     duration_display = seconds_to_display(duration_raw) if isinstance(duration_raw, (int, float)) else str(duration_raw)
     desc = info.get("description", "")
 
-    caption = f"📹 {title}\n👤 {uploader}\n👁 {views} | ⏱ {duration_display}\n"
-    if desc and len(desc) <= 200:
-        caption += f"📝 {desc}\n"
-    elif desc:
-        caption += "📄 توضیحات کامل در فایل بالا.\n"
+    # Build caption exactly as specified
+    caption = (
+        f"📹 {title}\n"
+        f"👤 {uploader}\n"
+        f"👁 {views} views\n"
+        f"⏱ {duration_display}\n"
+    )
+    if desc:
+        if len(desc) <= 200:
+            caption += f"📝 {desc}\n"
+        else:
+            caption += "📄 توضیحات کامل در فایل بالا.\n"
+    else:
+        caption += "📝 —\n"
     caption += f"🔗 https://youtube.com/watch?v={video_id}\n📥 /dl_{index}"
 
+    # Send description as file if long
     if desc and len(desc) > 200:
         desc_path = f"downloads/{chat_id}/{video_id}_desc.txt"
         os.makedirs(os.path.dirname(desc_path), exist_ok=True)
@@ -1091,11 +1118,16 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
     try:
         send_message(chat_id, "📥 دانلود ویدیو آغاز شد...")
         video_path = download_video(video_id, quality, save_dir, method=download_method)
-        if not video_path:
+        if not video_path or not os.path.exists(video_path):
             send_message(chat_id, "❌ دانلود ویدیو ناموفق بود.")
             return
 
         file_size = os.path.getsize(video_path)
+        if file_size == 0:
+            send_message(chat_id, "❌ فایل دانلود شده خراب است (حجم صفر).")
+            safe_remove(video_path)
+            return
+
         add_quota_usage(chat_id, file_size)
 
         if send_mode == "playable":
@@ -1104,6 +1136,10 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
             zip_base = os.path.splitext(video_path)[0]
             zip_path = f"{zip_base}.zip"
             shutil.make_archive(zip_base, 'zip', os.path.dirname(video_path), os.path.basename(video_path))
+            if not os.path.exists(zip_path) or os.path.getsize(zip_path) == 0:
+                send_message(chat_id, "❌ خطا در فشرده‌سازی فایل.")
+                safe_remove(video_path)
+                return
             parts = split_file_binary(zip_path, original_filename=os.path.basename(zip_path))
             safe_remove(zip_path)
 
@@ -1176,7 +1212,6 @@ def display_results_page(chat_id: int) -> None:
         else:
             send_message(chat_id, caption)
 
-    # Pagination button if more results
     if offset + count < len(all_ids):
         keyboard = {"inline_keyboard": [[{"text": "🔄 نتایج بیشتر", "callback_data": "more_results"}]]}
         send_message(chat_id, "برای نتایج بیشتر دکمه زیر را بزنید:", reply_markup=keyboard)
@@ -1185,7 +1220,7 @@ def display_results_page(chat_id: int) -> None:
 def handle_search_command(chat_id: int, query: str) -> None:
     settings = get_user_settings(chat_id)
     search_method = settings.get("search_method", "scrapetube")
-    limit = settings.get("result_count", 10) * 3  # fetch a bit more for pagination
+    limit = settings.get("result_count", 10) * 3
     if search_method == "scrapetube":
         results = _search_scrapetube(query, limit)
     elif search_method == "ytdlp":
@@ -1265,7 +1300,7 @@ def handle_channel_name_search(chat_id: int, query: str) -> None:
 
 def handle_channel_videos(chat_id: int, channel_id: str) -> None:
     send_message(chat_id, "⏳ در حال دریافت ویدیوهای کانال...")
-    limit = 100  # fetch many for pagination
+    limit = 100
     results = get_channel_videos_playwright(channel_id, limit)
     if not results:
         send_message(chat_id, "❌ ویدیویی یافت نشد.")
@@ -1280,7 +1315,7 @@ def handle_channel_videos(chat_id: int, channel_id: str) -> None:
         }
     display_results_page(chat_id)
 
-# ---------- Link confirmation (unchanged) ----------
+# ---------- Link confirmation ----------
 def handle_link_confirm(chat_id: int, video_id: str) -> None:
     info = _info_playwright(video_id) or _info_oembed(video_id)
     if not info:
@@ -1324,7 +1359,6 @@ def handle_link_confirm(chat_id: int, video_id: str) -> None:
 
 # ---------- Command processor ----------
 def process_message(chat_id: int, text: str) -> None:
-    # VIP/access check for restricted commands
     if not is_admin(chat_id) and not is_vip(chat_id):
         if text not in ("/start", "/help", "/vip") and not text.startswith("/vip "):
             send_message(chat_id, "⛔ لطفاً کد VIP را وارد کنید: /vip <code>")
@@ -1337,7 +1371,6 @@ def process_message(chat_id: int, text: str) -> None:
     with state_lock:
         state = USER_STATE.pop(chat_id, None)
 
-    # Handle awaiting states
     if state == "awaiting_query" and not text.startswith("/"):
         handle_search_command(chat_id, text)
         return
@@ -1355,7 +1388,6 @@ def process_message(chat_id: int, text: str) -> None:
         handle_channel_name_search(chat_id, text)
         return
 
-    # Commands
     if text == "/start":
         send_message(chat_id, "🤖 به ربات YouTube Bale خوش آمدید!", reply_markup=main_menu())
     elif text == "/search":
