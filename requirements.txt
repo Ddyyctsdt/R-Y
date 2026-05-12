@@ -1,4 +1,4 @@
-requests
-scrapetube
-beautifulsoup4
-playwright
+requests>=2.28.0
+scrapetube>=2.4.0
+playwright>=1.40.0
+yt-dlp>=2024.04.09
