@@ -1,8 +1,8 @@
 """
 bot.py - YouTube Bale Bot v5.0
 Advanced multi-method search, info, download, channel support, pagination, cookies,
-keyframe-aware video splitting, quality profiles, VIP auto-registration, admin panel,
-and silent channel handling.
+keyframe-aware video splitting replaced by 3-layer split, cookie expiry detection,
+VIP priority fix.
 """
 
 import os, re, sys, time, json, math, uuid, shutil, threading, subprocess, traceback, logging
@@ -139,128 +139,90 @@ def split_file_binary(file_path: str, original_filename: Optional[str] = None) -
             part_num += 1
     return part_paths
 
-def split_video_by_keyframes(video_path: str, chat_id: int = 0) -> List[str]:
-    """
-    Keyframe-aware split: produces chunks ≤ 18 MB (with safety margin).
-    Reports progress to user if chat_id provided.
-    Falls back to sending whole file if keyframe extraction fails.
-    """
-    TARGET_SIZE = 17 * 1024 * 1024  # 17 MB target, ~18 MB actual
-    ffprobe = shutil.which("ffprobe")
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffprobe or not ffmpeg:
-        if chat_id:
-            send_message(chat_id, "⚠️ امکان تقسیم خودکار ویدیو وجود نداشت. فایل کامل ارسال می‌شود.")
-        return [video_path]
+def split_video_by_size(video_path: str, max_size_bytes: int = MAX_SEND_SIZE, depth: int = 0) -> List[str]:
+    """Split video into playable chunks ≤ max_size_bytes.
+    Layer 1: MP4Box, Layer 2: ffmpeg -fs, Layer 3: binary split (last resort)."""
+    if not os.path.exists(video_path):
+        return []
+    total_size = os.path.getsize(video_path)
+    if total_size <= max_size_bytes:
+        dest = os.path.join(os.path.dirname(video_path), os.path.basename(video_path))
+        shutil.copy2(video_path, dest)
+        return [dest]
 
-    # Extract keyframe packets: only lines with ",K" flag
-    try:
-        cmd = [
-            ffprobe, "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "packet=pts_time,size,flags",
-            "-of", "csv=p=0", video_path
-        ]
-        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
-    except Exception as e:
-        logger.error(f"ffprobe keyframe extraction failed: {e}")
-        if chat_id:
-            send_message(chat_id, "⚠️ امکان تقسیم خودکار ویدیو وجود نداشت. فایل کامل ارسال می‌شود.")
-        return [video_path]
-
-    keyframes = []  # list of (pts_time, size) only keyframes
-    for line in out.strip().split("\n"):
-        if not line:
-            continue
-        parts = line.split(",")
-        if len(parts) >= 3 and parts[2].strip() == "K":
-            try:
-                pts_time = float(parts[0])
-                size = int(parts[1])
-                keyframes.append((pts_time, size))
-            except ValueError:
-                continue
-
-    if not keyframes:
-        if chat_id:
-            send_message(chat_id, "⚠️ امکان تقسیم خودکار ویدیو وجود نداشت. فایل کامل ارسال می‌شود.")
-        return [video_path]
-
-    # Compute cumulative sizes up to each keyframe
-    cum_sizes = []
-    total = 0
-    for pts, sz in keyframes:
-        total += sz
-        cum_sizes.append((pts, total))
-
-    # Group keyframes into chunks ≤ TARGET_SIZE
-    cut_points = []
-    current_start = 0.0
-    current_size = 0
-    prev_pts = 0.0
-    for i, (pts, cum_size) in enumerate(cum_sizes):
-        chunk_size = cum_size - current_size
-        if chunk_size > TARGET_SIZE and i > 0:
-            # Cut at previous keyframe (the one before current)
-            cut_pts = prev_pts
-            cut_points.append(cut_pts)
-            current_size = cum_sizes[i-1][1]  # cumulative size at previous keyframe
-            current_start = cut_pts
-        prev_pts = pts
-    # Add last segment (from last cut to end)
-    if cut_points:
-        last_cut = cut_points[-1]
-        if last_cut < keyframes[-1][0]:
-            # we have a final segment
-            pass
-    else:
-        # No cuts made, file fits in one chunk (already handled earlier if total size <= TARGET_SIZE)
-        # but we still split to be safe
-        pass
-
-    # If no cuts needed, return whole file
-    if not cut_points:
-        return [video_path]
-
-    # Add end point
-    cut_points.append(keyframes[-1][0] + 0.5)  # a little beyond
-
-    # Build chunk ranges
-    chunks = []
-    prev_cut = 0.0
-    for cp in cut_points:
-        if cp > prev_cut:
-            chunks.append((prev_cut, cp))
-            prev_cut = cp
-
-    total_chunks = len(chunks)
-    parts = []
     out_dir = os.path.dirname(video_path)
 
-    for idx, (start, end) in enumerate(chunks, 1):
-        if chat_id:
-            send_message(chat_id, f"✂️ در حال برش قطعه {idx} از {total_chunks}...")
-        out_path = os.path.join(out_dir, f"chunk_{idx:03d}.mp4")
-        cmd = [
-            ffmpeg, "-y", "-ss", str(start), "-to", str(end),
-            "-i", video_path, "-c", "copy", "-movflags", "+faststart",
-            out_path
-        ]
+    # Layer 1: MP4Box
+    mp4box = shutil.which("MP4Box")
+    if mp4box:
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-            if os.path.getsize(out_path) <= MAX_SEND_SIZE:
-                parts.append(out_path)
-            else:
-                logger.warning(f"Chunk {idx} exceeds MAX_SEND_SIZE despite keyframe alignment")
-                # Fallback for that chunk: binary split (but still add)
-                sub_parts = split_file_binary(out_path, original_filename=os.path.basename(out_path))
-                parts.extend(sub_parts)
-                safe_remove(out_path)
+            max_size_kb = max_size_bytes // 1024
+            cmd = [mp4box, "-splits", str(max_size_kb), video_path]
+            subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=out_dir)
+            basename_no_ext = os.path.splitext(os.path.basename(video_path))[0]
+            pattern = re.compile(rf"{re.escape(basename_no_ext)}_\d{{3}}\.mp4$")
+            parts = sorted([
+                os.path.join(out_dir, f) for f in os.listdir(out_dir) if pattern.match(f)
+            ])
+            if parts and all(os.path.getsize(p) <= max_size_bytes for p in parts):
+                return parts
+            logger.info("MP4Box produced files but some too large, falling back")
         except Exception as e:
-            logger.error(f"ffmpeg cut failed for chunk {idx}: {e}")
-            if chat_id:
-                send_message(chat_id, f"⚠️ برش قطعه {idx} با خطا مواجه شد.")
+            logger.warning(f"MP4Box split failed: {e}")
 
-    return parts if parts else [video_path]
+    # Layer 2: ffmpeg with -fs and -c copy
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if ffmpeg and ffprobe:
+        try:
+            dur_result = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
+                capture_output=True, text=True, check=True
+            )
+            duration = float(dur_result.stdout.strip())
+            if duration <= 0:
+                raise ValueError("Invalid duration")
+            avg_bitrate = (total_size * 8) / duration
+            chunk_time = (max_size_bytes * 8 * 0.9) / avg_bitrate
+            if chunk_time <= 0:
+                raise ValueError("Ridiculous chunk time")
+            start = 0.0
+            idx = 1
+            parts = []
+            while start < duration:
+                end = min(start + chunk_time, duration)
+                out_path = os.path.join(out_dir, f"chunk_{idx:03d}.mp4")
+                cmd = [
+                    ffmpeg, "-y", "-ss", str(start), "-to", str(end),
+                    "-i", video_path,
+                    "-fs", str(max_size_bytes),
+                    "-c", "copy", "-movflags", "+faststart",
+                    out_path
+                ]
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                # Ensure chunk is valid
+                try:
+                    cd_out = subprocess.run(
+                        [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", out_path],
+                        capture_output=True, text=True, check=True
+                    )
+                    chunk_dur = float(cd_out.stdout.strip())
+                    if chunk_dur <= 0:
+                        raise ValueError("Zero duration chunk")
+                except Exception:
+                    logger.warning(f"Chunk {idx} duration check failed, but file exists")
+                parts.append(out_path)
+                start = end
+                idx += 1
+            if parts and all(os.path.getsize(p) <= max_size_bytes for p in parts):
+                return parts
+            logger.info("ffmpeg -fs chunks still too large, falling back to binary")
+        except Exception as e:
+            logger.warning(f"ffmpeg -fs split failed: {e}")
+
+    # Layer 3: Binary split as absolute last resort
+    logger.warning("⚠️ Both MP4Box and ffmpeg failed – falling back to binary split (non-playable)")
+    return split_file_binary(video_path, original_filename=os.path.basename(video_path))
 
 def download_thumbnail(video_id: str, save_dir: str) -> Optional[str]:
     base = "https://img.youtube.com/vi/{}/{}"
@@ -575,9 +537,15 @@ def _search_ytdlp(query: str, limit: int) -> List[Dict[str, str]]:
         if os.path.exists(COOKIE_FILE):
             cmd.insert(1, "--cookies")
             cmd.insert(2, COOKIE_FILE)
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=SEARCH_TIMEOUT)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=SEARCH_TIMEOUT)
+        stderr = result.stderr
+        if "cookies are no longer valid" in stderr or "Sign in to confirm" in stderr:
+            logger.warning("yt-dlp search cookies expired — falling back")
+            return []
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, cmd, stderr=stderr)
         results = []
-        for line in proc.stdout.strip().split("\n"):
+        for line in result.stdout.strip().split("\n"):
             if not line:
                 continue
             parts = line.split("|", 2)
@@ -842,7 +810,6 @@ def _download_ytdlp(video_id: str, quality: str, save_dir: str) -> Optional[str]
             f"+bestaudio[ext=m4a]/best[height<={height}]"
         )
         max_bitrate = profile["max_bitrate"]
-        # Convert bitrate to numeric for bufsize
         bitrate_str = max_bitrate.replace("M", "e6").replace("k", "e3")
         try:
             bitrate_val = float(bitrate_str)
@@ -863,7 +830,18 @@ def _download_ytdlp(video_id: str, quality: str, save_dir: str) -> Optional[str]
         if os.path.exists(COOKIE_FILE):
             cmd.insert(1, "--cookies")
             cmd.insert(2, COOKIE_FILE)
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        stderr = result.stderr
+        if "cookies are no longer valid" in stderr or "Sign in to confirm" in stderr:
+            logger.warning("yt-dlp cookies expired — falling back to alternative download methods")
+            admin_id = load_users().get("admin_id", ADMIN_CHAT_ID)
+            try:
+                send_message(admin_id, "⚠️ کوکی‌های یوتیوب منقضی شده‌اند. لطفاً آنها را به‌روزرسانی کنید.")
+            except Exception:
+                pass
+            return None
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, cmd, stderr=stderr)
         if os.path.exists(video_path):
             return video_path
     except subprocess.CalledProcessError as e:
@@ -1105,7 +1083,7 @@ def handle_info(chat_id: int, video_id: str, index: int) -> None:
 def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = False) -> None:
     allowed, msg = check_quota_before(chat_id, QUOTA_THRESHOLD)
     if not allowed:
-        send_message(chat_id, msg)  # error to user's PV
+        send_message(chat_id, msg)
         return
 
     settings = get_user_settings(chat_id)
@@ -1116,7 +1094,7 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
     target_channel = settings.get("target_channel", 0)
 
     destination = int(target_channel) if target_channel else chat_id
-    report_chat_id = chat_id  # errors always go to user
+    report_chat_id = chat_id
 
     job_id = uuid.uuid4().hex[:8]
     save_dir = f"downloads/{chat_id}/{job_id}"
@@ -1124,7 +1102,7 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
 
     start_time = time.time()
     try:
-        send_message(destination, "📥 دانلود ویدیو آغاز شد...")  # progress to channel/group if set
+        send_message(destination, "📥 دانلود ویدیو آغاز شد...")
         video_path = download_video(video_id, quality, save_dir, method=download_method)
         if not video_path or not os.path.exists(video_path):
             send_message(report_chat_id, "❌ دانلود ویدیو ناموفق بود.")
@@ -1139,7 +1117,7 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
         add_quota_usage(chat_id, file_size)
 
         if send_mode == "playable":
-            parts = split_video_by_keyframes(video_path, chat_id=destination)
+            parts = split_video_by_size(video_path, MAX_SEND_SIZE)
         else:
             zip_base = os.path.splitext(video_path)[0]
             zip_path = f"{zip_base}.zip"
@@ -1363,14 +1341,17 @@ def process_message(chat_id: int, text: str) -> None:
         else:
             return
 
+    # Check VIP / admin status — but allow /vip, /start, /help for non-VIP
     if not is_admin(chat_id) and not is_vip(chat_id):
         if text not in ("/start", "/help", "/vip") and not text.startswith("/vip "):
             send_message(chat_id, "⛔ لطفاً کد VIP را وارد کنید: /vip <code>")
             return
 
+    # Check user existence in users.json — but don't block /vip
     if not is_admin(chat_id) and str(chat_id) not in load_users().get("users", {}):
-        send_message(chat_id, "⛔ دسترسی ندارید.")
-        return
+        if text not in ("/start", "/help", "/vip") and not text.startswith("/vip "):
+            send_message(chat_id, "⛔ دسترسی ندارید.")
+            return
 
     with state_lock:
         state = USER_STATE.pop(chat_id, None)
@@ -1591,7 +1572,6 @@ def info_method_keyboard(current: str) -> Dict:
 
 # ---------- Callback Handler ----------
 def process_callback(chat_id: int, data: str, message_id: int, callback_query_id: str) -> None:
-    # Silently ignore callbacks from channels
     if chat_id < 0:
         return
 
