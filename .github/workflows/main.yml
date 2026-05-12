@@ -1,4 +1,4 @@
-name: YouTube Bale Bot (3h cycle)
+name: YouTube Bale Bot v5.0 (3h cycle)
 
 on:
   schedule:
@@ -22,7 +22,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg gpac
 
       - name: Install Deno (JS Runtime for yt-dlp)
         run: |
@@ -35,7 +35,7 @@ jobs:
           pip install requests scrapetube playwright yt-dlp
           python -m playwright install --with-deps chromium
 
-      - name: Create cookies file
+      - name: Create cookies file from secret
         run: echo "${{ secrets.YT_COOKIES }}" > cookies.txt
 
       - name: Run bot (3 hours)
