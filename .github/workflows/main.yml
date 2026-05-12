@@ -27,7 +27,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install requests scrapetube playwright
+          pip install requests scrapetube playwright yt-dlp
           python -m playwright install --with-deps chromium
 
       - name: Run bot (3 hours)
