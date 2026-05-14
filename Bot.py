@@ -1,8 +1,7 @@
 """
-bot.py - YouTube Bale Bot v5.1
-Reverted to stable split logic (no MP4Box), fixed Zip creation with zipfile.ZipFile + fsync,
-resplit oversized video parts via ffmpeg, and classic binary naming for ZIP parts.
-VIP priority, channel handling, cookie expiry detection retained.
+bot.py - YouTube Bale Bot v5.2 (Bale Edition)
+Fixed video_mode handling in send_video_parts, added upload_retries setting.
+All core logic unchanged.
 """
 import os, re, sys, time, json, math, uuid, shutil, zipfile, threading, subprocess, traceback, logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -120,14 +119,8 @@ def download_file(url: str, save_dir: str, filename: Optional[str] = None, timeo
 
 def split_file_binary(file_path: str, original_filename: Optional[str] = None,
                       prefix: Optional[str] = None, ext: Optional[str] = None) -> List[str]:
-    """
-    Split a binary file into MAX_SEND_SIZE chunks.
-    If `prefix` and `ext` are given, use pattern: {prefix}{ext}.{001}, {prefix}{ext}.{002}, ...
-    (for ZIP classic naming). Otherwise use `original_filename` with .part{003} or derive from basename.
-    """
     out_dir = os.path.dirname(file_path) or "."
     if prefix is not None and ext is not None:
-        # Classic naming for ZIP, e.g., video_id.zip.001
         pattern = f"{prefix}{ext}.{{:03d}}"
     elif original_filename:
         pattern = f"{original_filename}.part{{:03d}}"
@@ -150,7 +143,6 @@ def split_file_binary(file_path: str, original_filename: Optional[str] = None,
     return part_paths
 
 def split_video_by_size(video_path: str, max_size_bytes: int = MAX_SEND_SIZE) -> List[str]:
-    """Split video into chunks ≤ max_size_bytes using ffmpeg -fs with retry fallback."""
     if not os.path.exists(video_path):
         return []
     total_size = os.path.getsize(video_path)
@@ -163,11 +155,10 @@ def split_video_by_size(video_path: str, max_size_bytes: int = MAX_SEND_SIZE) ->
     ffprobe = shutil.which("ffprobe")
     if not ffmpeg or not ffprobe:
         logger.error("ffmpeg/ffprobe not found")
-        return [video_path]  # return unsplit
+        return [video_path]
 
     out_dir = os.path.dirname(video_path)
 
-    # Primary method: ffmpeg -fs with -c copy and dynamic chunk_time
     try:
         dur_result = subprocess.run(
             [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", video_path],
@@ -198,7 +189,6 @@ def split_video_by_size(video_path: str, max_size_bytes: int = MAX_SEND_SIZE) ->
                 if os.path.getsize(out_path) <= max_size_bytes:
                     parts.append(out_path)
                     break
-                # oversized – reduce end time
                 safe_remove(out_path)
                 end = start + (end - start) * 0.8
                 if end - start < 0.5:
@@ -215,11 +205,9 @@ def split_video_by_size(video_path: str, max_size_bytes: int = MAX_SEND_SIZE) ->
         return [video_path]
 
 def resplit_video_chunk(chunk_path: str, max_size_bytes: int = MAX_SEND_SIZE) -> List[str]:
-    """Emergency resplit of an oversized video chunk using ffmpeg -fs."""
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
     if not ffmpeg or not ffprobe:
-        logger.warning("ffmpeg missing, cannot resplit chunk")
         return [chunk_path]
     try:
         dur = subprocess.run(
@@ -228,7 +216,7 @@ def resplit_video_chunk(chunk_path: str, max_size_bytes: int = MAX_SEND_SIZE) ->
         )
         duration = float(dur.stdout.strip())
         if duration <= 1:
-            return [chunk_path]  # too short to split
+            return [chunk_path]
         avg_bitrate = (os.path.getsize(chunk_path) * 8) / duration
         chunk_time = (max_size_bytes * 8 * 0.85) / avg_bitrate
         if chunk_time <= 0:
@@ -436,7 +424,7 @@ def check_vip_code(code: str, chat_id: int) -> Tuple[bool, str]:
             "photo_mode": "showable", "result_count": 10,
             "search_mode": "relevance", "search_method": "scrapetube",
             "info_method": "playwright", "download_method": "auto",
-            "target_channel": 0
+            "target_channel": 0, "upload_retries": 3
         }
         save_users(users_data)
     return True, "✅ کد VIP با موفقیت فعال شد."
@@ -458,7 +446,7 @@ def load_users() -> Dict:
                 "photo_mode": "showable", "result_count": 10,
                 "search_mode": "relevance", "search_method": "scrapetube",
                 "info_method": "playwright", "download_method": "auto",
-                "target_channel": 0
+                "target_channel": 0, "upload_retries": 3
             }
         for u in data["users"].values():
             u.setdefault("quota_used_bytes", 0)
@@ -474,6 +462,7 @@ def load_users() -> Dict:
             u.setdefault("info_method", "playwright")
             u.setdefault("download_method", "auto")
             u.setdefault("target_channel", 0)
+            u.setdefault("upload_retries", 3)
     return data
 
 def save_users(data: Dict) -> None:
@@ -532,7 +521,7 @@ def get_user_settings(chat_id: int) -> Dict:
         "photo_mode": "showable", "result_count": 10,
         "search_mode": "relevance", "search_method": "scrapetube",
         "info_method": "playwright", "download_method": "auto",
-        "target_channel": 0
+        "target_channel": 0, "upload_retries": 3
     })
 
 def update_user_setting(chat_id: int, key: str, value: Any) -> None:
@@ -952,9 +941,9 @@ def download_video(video_id: str, quality: str, save_dir: str, method: str = "au
     else:
         return _download_ytdlp(video_id, quality, save_dir)
 
-# ---------- Send parts ----------
+# ---------- Send parts (FIXED video_mode handling) ----------
 def send_video_parts(parts: List[str], chat_id: int, video_mode: str = "document",
-                     send_mode: str = "playable") -> bool:
+                     send_mode: str = "playable", max_retries: int = 3) -> bool:
     total = len(parts)
     slow_mode = False
     slow_counter = 0
@@ -962,24 +951,27 @@ def send_video_parts(parts: List[str], chat_id: int, video_mode: str = "document
         part_start = time.time()
         send_message(chat_id, f"📤 در حال ارسال پارت {i}/{total}...")
         success = False
-        for attempt in range(1, 4):
+        for attempt in range(1, max_retries + 1):
             if time.time() - part_start > 300:
                 send_message(chat_id, f"⛔ ارسال پارت {i} به‌دلیل اتمام وقت متوقف شد.")
                 return False
             try:
                 if send_mode == "playable":
-                    caption = "" if i == 1 else f"ادامه ویدیو... (بخش {i})"
-                    res = sendVideo(chat_id, part, caption=caption)
+                    if video_mode == "showable":
+                        caption = "" if i == 1 else f"ادامه ویدیو... (بخش {i})"
+                        res = sendVideo(chat_id, part, caption=caption)
+                    else:
+                        caption = "" if i == 1 else f"ادامه ویدیو... (بخش {i})"
+                        res = send_document(chat_id, part, caption=caption)
                 else:
                     caption = "ادامه ویدیو..." if i > 1 else ""
-                    # For zip parts, send as document
                     res = send_document(chat_id, part, caption=caption)
                 if res and res.get("ok"):
                     success = True
                     break
             except Exception:
                 pass
-            if attempt < 3:
+            if attempt < max_retries:
                 send_message(chat_id, f"🔄 تلاش {attempt+1} برای پارت {i} در ۱۰ ثانیه...")
                 time.sleep(10)
             else:
@@ -1124,6 +1116,7 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
     video_mode = settings.get("video_mode", "document")
     download_method = settings.get("download_method", "auto")
     target_channel = settings.get("target_channel", 0)
+    max_retries = settings.get("upload_retries", 3)
 
     destination = int(target_channel) if target_channel else chat_id
     report_chat_id = chat_id
@@ -1151,7 +1144,6 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
         if send_mode == "playable":
             parts = split_video_by_size(video_path, MAX_SEND_SIZE)
         else:
-            # ZIP mode using zipfile.ZipFile (robust)
             time.sleep(1)
             zip_base = os.path.splitext(video_path)[0]
             zip_path = f"{zip_base}.zip"
@@ -1177,7 +1169,6 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
                 safe_remove(video_path)
                 return
 
-            # Integrity check
             try:
                 with zipfile.ZipFile(zip_path, 'r') as zf:
                     if zf.testzip() is not None:
@@ -1216,7 +1207,7 @@ def handle_download(chat_id: int, video_id: str, index: int, confirmed: bool = F
             send_message(report_chat_id, "⛔ خطا در آماده‌سازی فایل برای ارسال.")
             return
 
-        if send_video_parts(parts, destination, video_mode, send_mode):
+        if send_video_parts(parts, destination, video_mode, send_mode, max_retries):
             send_message(destination, "✅ ویدیو با موفقیت ارسال شد.")
             end_time = time.time()
             elapsed = end_time - start_time
@@ -1417,7 +1408,11 @@ def handle_link_confirm(chat_id: int, video_id: str) -> None:
 
 # ---------- Command processor ----------
 def process_message(chat_id: int, text: str) -> None:
-    # Channel silence is now handled in main() by checking chat type = "channel"
+    if chat_id < 0:
+        if text.startswith("/set_channel") or text.startswith("/unset_channel"):
+            pass
+        else:
+            return
 
     if not is_admin(chat_id) and not is_vip(chat_id):
         if text not in ("/start", "/help", "/vip") and not text.startswith("/vip "):
@@ -1568,6 +1563,7 @@ def settings_menu(s: Dict) -> Dict:
     dl_method = s.get("download_method", "auto")
     search_method = s.get("search_method", "scrapetube")
     info_method = s.get("info_method", "playwright")
+    retries = s.get("upload_retries", 3)
     return {"inline_keyboard": [
         [{"text": f"🎬 کیفیت: {s.get('quality')}", "callback_data": "set_quality"}],
         [{"text": f"📦 حالت ارسال: {'فیلم (قابل پخش)' if s.get('send_mode')=='playable' else 'زیپ (فشرده)'}", "callback_data": "set_mode"}],
@@ -1579,6 +1575,7 @@ def settings_menu(s: Dict) -> Dict:
         [{"text": f"📥 روش دانلود: {dl_method}", "callback_data": "set_dl_method"}],
         [{"text": f"🔍 روش جستجو: {search_method}", "callback_data": "set_search_method"}],
         [{"text": f"ℹ️ روش اطلاعات: {info_method}", "callback_data": "set_info_method"}],
+        [{"text": f"🔄 تلاش آپلود: {retries} بار", "callback_data": "set_retries"}],
         [{"text": "🔙 بازگشت", "callback_data": "main_menu"}]
     ]}
 
@@ -1646,10 +1643,14 @@ def info_method_keyboard(current: str) -> Dict:
     btns.append([{"text": "🔙 بازگشت", "callback_data": "settings"}])
     return {"inline_keyboard": btns}
 
+def retries_keyboard(current: int) -> Dict:
+    options = [3, 5, 7, 10]
+    btns = [[{"text": f"{'✅' if o == current else '○'} {o} بار", "callback_data": f"retries_{o}"}] for o in options]
+    btns.append([{"text": "🔙 بازگشت", "callback_data": "settings"}])
+    return {"inline_keyboard": btns}
+
 # ---------- Callback Handler ----------
 def process_callback(chat_id: int, data: str, message_id: int, callback_query_id: str) -> None:
-    # Channel silence is handled in main()
-
     toast_text = ""
     if data == "search":
         with state_lock:
@@ -1773,6 +1774,16 @@ def process_callback(chat_id: int, data: str, message_id: int, callback_query_id
         edit_message_text(chat_id, message_id, f"✅ {toast_text}")
         s = get_user_settings(chat_id)
         send_message(chat_id, "⚙️ تنظیمات:", reply_markup=settings_menu(s))
+    elif data == "set_retries":
+        s = get_user_settings(chat_id)
+        edit_message_text(chat_id, message_id, "🔄 تعداد تلاش آپلود:", reply_markup=retries_keyboard(s.get("upload_retries", 3)))
+    elif data.startswith("retries_"):
+        val = int(data.split("_", 1)[1])
+        update_user_setting(chat_id, "upload_retries", val)
+        toast_text = f"تعداد تلاش روی {val} تنظیم شد."
+        edit_message_text(chat_id, message_id, f"✅ {toast_text}")
+        s = get_user_settings(chat_id)
+        send_message(chat_id, "⚙️ تنظیمات:", reply_markup=settings_menu(s))
     elif data == "confirm_dl":
         vid = PENDING_DOWNLOADS.pop(chat_id, None)
         if vid:
@@ -1789,7 +1800,7 @@ def process_callback(chat_id: int, data: str, message_id: int, callback_query_id
 
 # ---------- Main ----------
 def main():
-    logger.info("YouTube Bale Bot v5.1 started")
+    logger.info("YouTube Bale Bot v5.2 started")
     os.makedirs("downloads", exist_ok=True)
     offset = 0
     while True:
